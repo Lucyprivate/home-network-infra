@@ -1,0 +1,79 @@
+# Headscale v0.29.5. TLS terminates at the existing Caddy service.
+server_url: {{HEADSCALE_URL}}
+listen_addr: 127.0.0.1:18080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+trusted_proxies:
+  - 127.0.0.1/32
+  - ::1/128
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+prefixes:
+  v4: {{TAILNET_CIDR}}
+  v6: ""
+  allocation: sequential
+
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: headscale
+    region_name: Home Headscale DERP
+    verify_clients: true
+    stun_listen_addr: 0.0.0.0:3478
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+    ipv4: {{VPS_PUBLIC_IP}}
+    ipv6: ""
+  urls: []
+  paths:
+    - /etc/headscale/derp-public.yaml
+  auto_update_enabled: true
+  update_frequency: 3h
+
+disable_check_updates: true
+node:
+  expiry: "0"
+  ephemeral:
+    inactivity_timeout: 30m
+  routes:
+    ha:
+      probe_interval: 0
+      probe_timeout: 5s
+
+database:
+  type: sqlite
+  debug: false
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+    wal_autocheckpoint: 1000
+
+tls_letsencrypt_hostname: ""
+tls_cert_path: ""
+tls_key_path: ""
+log:
+  level: info
+  format: text
+policy:
+  mode: file
+  path: /etc/headscale/policy.hujson
+dns:
+  magic_dns: true
+  base_domain: "{{MAGICDNS_DOMAIN}}"
+  override_local_dns: false
+  nameservers:
+    global: []
+    split: {}
+  search_domains: []
+  extra_records: []
+unix_socket: /run/headscale/headscale.sock
+unix_socket_permission: "0770"
+logtail:
+  enabled: false
+taildrop:
+  enabled: false
+auto_update:
+  enabled: false

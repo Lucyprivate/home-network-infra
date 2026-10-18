@@ -1,0 +1,20 @@
+[Unit]
+Description=Offline PDF service (public reference)
+Requires=docker.service stirling-guard.service stirling-pdf.slice
+After=docker.service stirling-guard.service stirling-pdf.slice
+BindsTo=docker.service stirling-guard.service
+[Service]
+Type=simple
+WorkingDirectory=/srv/stirling-pdf
+ExecStartPre=/usr/bin/python3 /srv/stirling-pdf/tools/network_guard.py --check-stack
+ExecStartPre=/usr/bin/python3 -I -B /srv/stirling-pdf/tools/paddle_zero_swap_order5.py --check-parent
+ExecStart=/usr/bin/docker compose -p stirling-pdf -f /srv/stirling-pdf/compose.yaml up --pull never --no-build --abort-on-container-exit
+ExecStartPost=/usr/bin/python3 -I -B /srv/stirling-pdf/tools/paddle_zero_swap_order5.py --scope-enforce --wait-seconds 40
+ExecStop=/usr/bin/python3 /srv/stirling-pdf/tools/network_guard.py --stop-stack
+ExecStopPost=/usr/bin/python3 /srv/stirling-pdf/tools/network_guard.py --stop-stack
+TimeoutStartSec=90
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+[Install]
+WantedBy=multi-user.target

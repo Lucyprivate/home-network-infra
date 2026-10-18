@@ -1,0 +1,12 @@
+# EMPTY CREDENTIALS: insert privately, outside the repository.
+[Interface]
+PrivateKey =
+Address = {{WG_CLIENT_IP}}/30
+MTU = 1380
+Table = off
+
+[Peer]
+PublicKey =
+Endpoint = {{VPS_PUBLIC_IP}}:{{WG_PORT}}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25

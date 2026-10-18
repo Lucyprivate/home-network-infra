@@ -1,0 +1,9 @@
+# Selected settings only, merge with independently created disks/boot settings.
+name: router
+cores: 2
+memory: 1024
+onboot: 1
+startup: order=1,up=30
+net0: virtio,bridge=vmbr0,firewall=1
+net1: virtio,bridge=vmbr1,firewall=1
+serial0: socket

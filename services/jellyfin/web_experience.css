@@ -1,0 +1,59 @@
+/* Native Jellyfin Web 12.2 Live TV only. No external assets or player changes. */
+#liveTvPage .card[data-type="TvChannel"] .cardImageContainer {
+    background-size: contain !important;
+    background-repeat: no-repeat;
+    background-color: rgba(127, 127, 127, 0.08);
+}
+
+#liveTvPage .card[data-type="TvChannel"] img.cardImage {
+    object-fit: contain;
+}
+
+#liveTvPage .card[data-type="TvChannel"] .cardText {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.4;
+    padding-block: 0.12em;
+}
+
+#liveTvPage .card[data-type="TvChannel"] .cardText-first {
+    color: inherit;
+    font-weight: 500;
+    opacity: 1;
+}
+
+#liveTvPage .tvguide .guideProgramNameText,
+#liveTvPage .tvguide .guideChannelName {
+    color: #f3f4f6;
+    font-size: max(0.95rem, 15px);
+    font-weight: 500;
+    opacity: 1;
+}
+
+#liveTvPage .tvguide .guideChannelImage {
+    background-size: contain;
+}
+
+@media (max-width: 50em) {
+    #liveTvPage .card[data-type="TvChannel"] .cardText {
+        padding-block: 0.2em;
+    }
+
+    #liveTvPage .card[data-type="TvChannel"] .cardOverlayButton,
+    #liveTvPage .card[data-type="TvChannel"] .cardText-first a {
+        min-height: 44px;
+        min-width: 44px;
+    }
+
+    #liveTvPage .card[data-type="TvChannel"] .cardText-first a {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    #liveTvPage .tvguide .btnGuideViewSettings,
+    #liveTvPage .tvguide .guideDateTabs .emby-tab-button {
+        min-height: 44px;
+        min-width: 44px;
+    }
+}

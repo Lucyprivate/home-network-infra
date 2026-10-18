@@ -1,0 +1,23 @@
+[Unit]
+Description=Jellyfin Live TV firewall before Docker restores containers
+After=local-fs.target systemd-modules-load.service nftables.service ufw.service firewalld.service
+Before=docker.service
+RequiresMountsFor=/srv/jellyfin/tools/livetv /srv/jellyfin/livetv/runtime
+
+[Service]
+Type=oneshot
+User=root
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /srv/jellyfin/tools/livetv/early_firewall.py
+TimeoutStartSec=60
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/jellyfin/livetv/runtime
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

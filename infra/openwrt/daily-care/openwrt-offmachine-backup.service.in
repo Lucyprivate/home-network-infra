@@ -1,0 +1,10 @@
+[Unit]
+Description=OpenWrt VM100 private off-machine backup copy
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 "@TOOL@" --ssh-config "@SSH_CONFIG@" --host pve-uplink --destination "@DESTINATION@"
+UMask=0077
+NoNewPrivileges=true
+Nice=10
+TimeoutStartSec=35min

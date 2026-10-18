@@ -1,0 +1,175 @@
+{
+  "name": "jfmedia",
+  "services": {
+    "jellyfin": {
+      "restart": "on-failure:3",
+      "container_name": "jellyfin-media",
+      "cap_drop": [
+        "ALL"
+      ],
+      "command": null,
+      "devices": [
+        {
+          "source": "/dev/dri/renderD128",
+          "target": "/dev/dri/renderD128",
+          "permissions": "rw"
+        }
+      ],
+      "dns": [
+        "10.10.10.1"
+      ],
+      "entrypoint": null,
+      "environment": {
+        "LIBVA_DRIVER_NAME": "iHD",
+        "TZ": "Etc/UTC"
+      },
+      "group_add": [
+        "991",
+        "10002"
+      ],
+      "image": "jellyfin/jellyfin@sha256:357724bf0ae27a672c7cbaa899db2d9abeb13dbd8657ccce750258a4c059d037",
+      "mem_limit": "2147483648",
+      "networks": {
+        "media": {
+          "aliases": [
+            "jellyfin",
+            "jellyfin-media"
+          ],
+          "ipv4_address": "172.28.40.3"
+        }
+      },
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/srv/jellyfin/config",
+          "target": "/config",
+          "bind": {}
+        },
+        {
+          "type": "bind",
+          "source": "/srv/jellyfin/cache",
+          "target": "/cache",
+          "bind": {}
+        },
+        {
+          "type": "bind",
+          "source": "/srv/jellyfin/media",
+          "target": "/media",
+          "read_only": true,
+          "bind": {}
+        },
+        {
+          "type": "bind",
+          "source": "/srv/jellyfin/livetv",
+          "target": "/livetv",
+          "read_only": true
+        }
+      ]
+    },
+    "gateway": {
+      "image": "local/jellyfin-caddy:no-file-capabilities",
+      "container_name": "jellyfin-gateway",
+      "user": "10002:10002",
+      "command": [
+        "caddy",
+        "run",
+        "--config",
+        "/etc/caddy/Caddyfile",
+        "--adapter",
+        "caddyfile"
+      ],
+      "ports": [
+        "0.0.0.0:8096:8096/tcp"
+      ],
+      "volumes": [
+        "/srv/jellyfin/tools/livetv/Caddyfile:/etc/caddy/Caddyfile:ro"
+      ],
+      "environment": {
+        "TZ": "Etc/UTC",
+        "XDG_DATA_HOME": "/tmp/caddy-data",
+        "XDG_CONFIG_HOME": "/tmp/caddy-config"
+      },
+      "mem_limit": "128m",
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:rw,noexec,nosuid,size=16m"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "restart": "on-failure:3",
+      "networks": {
+        "media": {
+          "ipv4_address": "172.28.40.4"
+        }
+      }
+    },
+    "playback-lock": {
+      "image": "python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f",
+      "container_name": "jellyfin-live-lock",
+      "user": "10004:10002",
+      "command": [
+        "python",
+        "-B",
+        "/app/playback_gate.py"
+      ],
+      "volumes": [
+        "/srv/jellyfin/tools/livetv/playback_gate.py:/app/playback_gate.py:ro",
+        "/srv/jellyfin/livetv/credentials/gate-key.json:/credentials/jellyfin-updater.json:ro"
+      ],
+      "environment": {
+        "TZ": "Etc/UTC",
+        "JELLYFIN_BASE": "http://172.28.40.3:8096",
+        "GATE_CONTROL_KEY_FILE": "/credentials/jellyfin-updater.json"
+      },
+      "dns": [
+        "10.10.10.1"
+      ],
+      "mem_limit": "96m",
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:rw,noexec,nosuid,size=8m"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "restart": "on-failure:3",
+      "networks": {
+        "media": {
+          "ipv4_address": "172.28.40.6",
+          "aliases": [
+            "jellyfin-live-lock"
+          ]
+        }
+      }
+    }
+  },
+  "networks": {
+    "media": {
+      "name": "jfmedia_media",
+      "driver": "bridge",
+      "driver_opts": {
+        "com.docker.network.bridge.name": "br-jfmedia"
+      },
+      "ipam": {
+        "config": [
+          {
+            "subnet": "172.28.40.0/28",
+            "gateway": "172.28.40.1"
+          }
+        ]
+      },
+      "enable_ipv6": false
+    }
+  }
+}

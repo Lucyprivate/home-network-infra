@@ -1,0 +1,7 @@
+{
+  "luci-app-vpn-egress": {
+    "description": "View and manage the WireGuard egress controller",
+    "read": {"ubus": {"luci.vpn-egress": ["status"]}},
+    "write": {"ubus": {"luci.vpn-egress": ["control"]}}
+  }
+}

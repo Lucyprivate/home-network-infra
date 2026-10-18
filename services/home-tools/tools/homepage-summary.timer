@@ -1,0 +1,11 @@
+[Unit]
+Description=Check Homepage service availability every 30 seconds
+
+[Timer]
+OnBootSec=40s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=homepage-summary.service
+
+[Install]
+WantedBy=timers.target

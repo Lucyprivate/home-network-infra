@@ -1,0 +1,26 @@
+# New VM example. Verify actual interface names/MACs before activation.
+# Only the uplink NIC provides a default route. The downstream NIC has none.
+network:
+  version: 2
+  ethernets:
+    uplink:
+      match:
+        name: enp6s18
+      dhcp4: false
+      addresses: [{{APP_UPLINK_IP}}/24]
+      routes:
+        - to: default
+          via: {{UPLINK_GATEWAY}}
+      nameservers:
+        addresses: [{{UPLINK_GATEWAY}}]
+      dhcp6: false
+      accept-ra: false
+    downstream:
+      match:
+        macaddress: '{{APP_LAN_MAC}}'
+      dhcp4: true
+      dhcp4-overrides:
+        use-routes: false
+        use-dns: false
+      dhcp6: false
+      accept-ra: false

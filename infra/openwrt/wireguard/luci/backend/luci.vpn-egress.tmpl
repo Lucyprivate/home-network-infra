@@ -1,0 +1,129 @@
+#!/usr/bin/ucode
+// SPDX-License-Identifier: MIT
+'use strict';
+import { popen } from 'fs';
+import { init_enabled } from 'luci.sys';
+
+// Every process and argument is fixed here. No caller supplied command/path.
+const COMMANDS = {
+ controller: '/usr/bin/timeout 3 /usr/sbin/vpn-egress status 2>/dev/null',
+ operation: '/usr/bin/timeout 8 /usr/libexec/vpn-egress-webctl status 2>/dev/null',
+ service: '/usr/bin/timeout 2 /bin/ubus call service list \'{"name":"vpn-egress"}\' 2>/dev/null',
+ address: '/usr/bin/timeout 2 /sbin/ip -j -4 address show dev wg_exit 2>/dev/null',
+ handshakes: '/usr/bin/timeout 2 /usr/bin/wg show wg_exit latest-handshakes 2>/dev/null',
+ transfer: '/usr/bin/timeout 2 /usr/bin/wg show wg_exit transfer 2>/dev/null',
+ listen: '/usr/bin/timeout 2 /usr/bin/wg show wg_exit listen-port 2>/dev/null',
+ direct: '/usr/bin/timeout 20 /usr/libexec/vpn-egress-webctl submit direct 2>/dev/null',
+ resume: '/usr/bin/timeout 20 /usr/libexec/vpn-egress-webctl submit resume 2>/dev/null'
+};
+function command(name) {
+ const p = popen(COMMANDS[name]);
+ if (!p) return null;
+ const data = p.read(32769), rc = p.close();
+ return (rc == 0 || (rc == 1 && index(['direct','resume'],name)>=0)) && type(data) == 'string' && length(data) <= 32768 ? trim(data) : null;
+}
+function parsed(name) {
+ const raw = command(name);
+ if (raw == null) return null;
+ try { return json(raw); } catch(e) { return null; }
+}
+function count(v) { return type(v) == 'int' && v >= 0 && v <= 9007199254740991; }
+function safe_text(v, n) { return type(v) == 'string' && length(v) <= n && !match(v, /[[:cntrl:]]/); }
+function iso(v) { return v == null || (type(v) == 'string' && match(v, /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/)); }
+function controller(v) {
+ if (type(v)=='object') {
+  if (v.updated_utc=='') v.updated_utc=null;
+  if (v.last_health_utc=='') v.last_health_utc=null;
+ }
+ if (type(v) != 'object' || v.schema != 1 ||
+     index(['WG_ACTIVE','DIRECT_LATCHED'], v.mode) < 0 ||
+     index(['wireguard','direct'], v.transport) < 0 ||
+     type(v.production_routing) != 'bool' || type(v.routing_consistent) != 'bool' ||
+     type(v.tunnel_healthy) != 'bool' || !count(v.failures) ||
+     !safe_text(v.reason, 80) || !iso(v.updated_utc) || !iso(v.last_health_utc) ||
+     v.expected_exit_ipv4 != '{{VPS_PUBLIC_IP}}' || type(v.endpoint) != 'object' ||
+     v.endpoint.address != '{{VPS_PUBLIC_IP}}' || v.endpoint.port != 51820 || v.endpoint.protocol != 'udp')
+  return null;
+ return {mode:v.mode,transport:v.transport,production_routing:v.production_routing,
+  routing_consistent:v.routing_consistent,tunnel_healthy:v.tunnel_healthy,
+  failures:v.failures,reason:v.reason,updated_utc:v.updated_utc,last_health_utc:v.last_health_utc,
+  expected_exit_ipv4:v.expected_exit_ipv4,endpoint:{address:v.endpoint.address,port:51820,protocol:'udp'}};
+}
+function operation(v) {
+ if (type(v) != 'object' || type(v.running) != 'bool' ||
+     (v.action != null && index(['direct','resume'], v.action) < 0) ||
+     index(['none','pending','success','failed','timed_out','interrupted'],v.result) < 0 ||
+     !iso(v.started_utc) || !iso(v.completed_utc) ||
+     (v.running && (v.action == null || v.result != 'pending')))
+  return null;
+ return {running:v.running,action:v.action ?? null,result:v.result,
+  started_utc:v.started_utc ?? null,completed_utc:v.completed_utc ?? null};
+}
+function table(text, columns) {
+ if (text == null) return null;
+ let result = {}, n = 0;
+ for (let row in split(text, '\n')) {
+  if (!length(row)) continue;
+  const cells = split(row, /[\t ]+/);
+  if (length(cells) != columns || !match(cells[0], /^[A-Za-z0-9+\/]{43}=$/) || result[cells[0]] != null)
+   return null;
+  let numbers = [];
+  for (let cell in slice(cells, 1)) {
+   if (!match(cell, /^[0-9]{1,16}$/)) return null;
+   const value = +cell;
+   if (!count(value)) return null;
+   push(numbers,value);
+  }
+  result[cells[0]] = numbers; n++;
+  if (n > 16) return null;
+ }
+ return result;
+}
+function tunnel() {
+ let t = {up:false,address:null,mtu:null,listen_port:null,peer_count:null,last_handshake:null,rx_bytes:null,tx_bytes:null};
+ const addresses = parsed('address');
+ if (type(addresses) != 'array' || length(addresses) != 1 || addresses[0].ifname != 'wg_exit') return t;
+ const iface = addresses[0];
+ t.up = type(iface.flags) == 'array' && index(iface.flags,'UP') >= 0;
+ if (count(iface.mtu) && iface.mtu >= 576 && iface.mtu <= 65535) t.mtu=iface.mtu;
+ for (let a in iface.addr_info ?? [])
+  if (a.family == 'inet' && a.local == '{{WG_CLIENT_IP}}' && a.prefixlen == 30) t.address='{{WG_CLIENT_IP}}/30';
+ const handshakes=table(command('handshakes'),2), transfers=table(command('transfer'),3);
+ const listen=command('listen');
+ if (listen != null && match(listen,/^[0-9]{1,5}$/) && +listen>0 && +listen<=65535) t.listen_port=+listen;
+ if (handshakes == null || transfers == null || length(keys(handshakes)) != length(keys(transfers))) return t;
+ let rx=0,tx=0,last=0;
+ for (let key in keys(handshakes)) {
+  if (transfers[key] == null) return t;
+  rx+=transfers[key][0]; tx+=transfers[key][1]; last=max(last,handshakes[key][0]);
+ }
+ if (!count(rx) || !count(tx)) return t;
+ t.peer_count=length(keys(handshakes));t.rx_bytes=rx;t.tx_bytes=tx;
+ t.last_handshake=last>0 ? last : null;
+ return t;
+}
+function service() {
+ const data=parsed('service');let running=false;
+ for(let instance in values(data?.['vpn-egress']?.instances ?? {}))
+  if(instance.running === true && type(instance.command)=='array' &&
+     length(instance.command)==2 && instance.command[0]=='/usr/sbin/vpn-egress' && instance.command[1]=='watch') running=true;
+ return {enabled:!!init_enabled('vpn-egress'),running};
+}
+function status() {
+ const c=controller(parsed('controller')), op=operation(parsed('operation')?.operation);
+ if(!c) return {error:'Controller status is unavailable'};
+ if(!op) return {error:'Web operation status is unavailable'};
+ return {schema:1,controller:c,tunnel:tunnel(),operation:op,service:service()};
+}
+const methods={
+ status:{call:function(){return status();}},
+ control:{args:{action:''},call:function(req){
+  const action=req.args?.action;
+  if(type(action)!='string' || index(['direct','resume'],action)<0) return {error:'Unsupported action'};
+  const answer=parsed(action), op=operation(answer?.operation);
+  if(answer?.accepted === true && op?.running && op.action==action) return {accepted:true,operation:op};
+  const allowed=['An operation is already running','Operation state is invalid','Controller dependencies are unavailable','Unable to start operation','Operation queue is busy','An egress operation is already running','Another operation is being prepared','An egress worker is still running','The egress worker could not be started'];
+  return {error:index(allowed,answer?.error)>=0 ? answer.error : 'Unable to start operation'};
+ }}
+};
+return {'luci.vpn-egress':methods};

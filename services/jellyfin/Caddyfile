@@ -1,0 +1,39 @@
+{
+    admin off
+    auto_https off
+    persist_config off
+    log {
+        format filter {
+            wrap json
+            fields {
+                request>uri delete
+                request>headers delete
+            }
+        }
+    }
+}
+
+http://:8096 {
+    @nativeNegotiation {
+        method POST
+        path_regexp nativeNegotiation (?i)^/(emby/)?(items/[^/]+/playbackinfo|livestreams/open)/?$
+    }
+    uri @nativeNegotiation query {
+        -enableDirectPlay
+        -enableDirectStream
+        -forceDirectPlay
+        -forceDirectStream
+        EnableDirectPlay false
+        EnableDirectStream false
+        ForceDirectPlay false
+        ForceDirectStream false
+    }
+    @playback path_regexp playback (?i)^/(emby/)?(items/[^/]+/playbackinfo|livestreams/open|videos/.*|livetv/livestreamfiles/.*|sessions/playing(/.*)?)/?$
+    forward_auth @playback jellyfin-live-lock:8080 {
+        uri /authorize
+        header_up X-Jf-Live-Client {http.request.remote.host}
+    }
+    reverse_proxy jellyfin-media:8096 {
+        flush_interval -1
+    }
+}

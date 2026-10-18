@@ -1,0 +1,15 @@
+[Unit]
+Description=ServiceHost home tools ingress guard
+Requires=docker.service
+After=docker.service
+PartOf=docker.service
+Before=home-tools.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /srv/home-tools/tools/network_guard.py --apply
+TimeoutStartSec=45
+
+[Install]
+WantedBy=multi-user.target

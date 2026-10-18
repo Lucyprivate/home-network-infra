@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+import argparse,json,os,pathlib,subprocess,sys
+L=pathlib.Path('/srv/jellyfin/livetv');T=pathlib.Path('/srv/jellyfin/tools/livetv')
+p=argparse.ArgumentParser();p.add_argument('action',choices=['update','status']);p.add_argument('--epg',action='store_true');a=p.parse_args()
+if os.geteuid()!=0:p.error('Use sudo jf-live update|status')
+if a.action=='update':
+ unit='jellyfin-livetv-update'+('-epg' if a.epg else '')+'.service'
+ subprocess.run(['systemctl','start','--no-block',unit],check=True)
+ print('Live TV update started. Use sudo jf-live status to check progress.')
+else:
+ out={}
+ for n in ['progress.json','current/status.json','network-status.json']:
+  f=L/n
+  if f.is_file():out[n]=json.loads(f.read_text())
+ for key,args in {'timers':['systemctl','list-timers','jellyfin-livetv-update*.timer','--no-pager'],'services':['systemctl','show','jellyfin-stack.service','jellyfin-livetv-guard.service','jellyfin-livetv-update.service','jellyfin-livetv-update-epg.service','-p','Id','-p','ActiveState','-p','Result']}.items():
+  out[key]=subprocess.run(args,capture_output=True,text=True).stdout
+ print(json.dumps(out,ensure_ascii=False,indent=2))

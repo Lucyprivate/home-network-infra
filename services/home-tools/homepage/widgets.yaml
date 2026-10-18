@@ -1,0 +1,8 @@
+- resources:
+    label: ServiceHost
+    cpu: true
+    memory: true
+    disk: /
+    uptime: true
+    refresh: 10000
+    expanded: true

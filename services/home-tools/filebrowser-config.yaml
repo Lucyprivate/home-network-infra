@@ -1,0 +1,62 @@
+{
+  "http": {
+    "port": 80,
+    "listen": "0.0.0.0",
+    "baseURL": "/",
+    "disableWebDAV": true
+  },
+  "server": {
+    "database": {
+      "path": "/home/filebrowser/data/database.sqlite"
+    },
+    "cacheDir": "/home/filebrowser/data/cache",
+    "cacheDirCleanup": true,
+    "disablePreviews": true,
+    "disableUpdateCheck": true,
+    "numImageProcessors": 1,
+    "sources": [
+      {
+        "path": "/srv",
+        "name": "Files",
+        "config": {
+          "defaultEnabled": true,
+          "defaultUserScope": "/",
+          "private": true,
+          "rules": [
+            {
+              "folderPath": "/",
+              "ignoreSymlinks": true
+            }
+          ],
+          "defaultPermissions": {
+            "view": true,
+            "download": true,
+            "modify": true,
+            "delete": true,
+            "create": true,
+            "configured": true
+          }
+        }
+      }
+    ]
+  },
+  "auth": {
+    "adminUsername": "labuser",
+    "methods": {
+      "password": {
+        "enabled": true,
+        "minLength": 12,
+        "signup": false
+      }
+    }
+  },
+  "userDefaults": {
+    "ui": {
+      "locale": "en"
+    }
+  },
+  "frontend": {
+    "name": "FileBrowser Quantum",
+    "disableDefaultLinks": true
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "description": "Anonymous source integrity pins, not a production ownership receipt.",
+  "files": {
+    "paddle_geometry4.py": "cf0708101fe1ff50e4bb2353c6fe6897be8b5ebbe64cfdad1c31e1f2482e8f65",
+    "paddle_layout_v2.py": "945856f4496d2695d4731e904711c1767b4bbeaa30a73954e3c3dfbc1a195e72",
+    "paddle_plugin.py": "8ef7f3cead4e28faeb4c73e0e10c904bbd0b7a3a1e57aeb157ba4a3a9498afd8",
+    "paddle_probe.py": "e54d1b413a676d85b8df4738d511cc017c86f2f96be0e4b1e2683305c3509998",
+    "paddle_renderer5.py": "fd1413696c1bd99d88c161b0482366035ec534bf6520791c20ec72c4b783fa46",
+    "paddle_zero_swap_order5.py": "ec2b72a7310f01db1bff1376118bc2e466d3092e1bb610f18b52b499606ea73e"
+  }
+}

@@ -1,0 +1,6 @@
+[Unit]
+Description=Stirling-PDF private zero-swap container parent
+
+[Slice]
+MemoryAccounting=yes
+MemorySwapMax=0

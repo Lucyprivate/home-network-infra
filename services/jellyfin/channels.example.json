@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "sources": {
+    "metadata": "https://iptv-org.github.io/api/",
+    "epg": "https://example.invalid/xmltv.xml.gz",
+    "english_playlist": "https://example.invalid/channels.m3u"
+  },
+  "mapping_policy": "Configure exact aliases and permitted feeds locally.",
+  "channels": [
+    {
+      "channel": "Example.example",
+      "name": "Example channel",
+      "region": "EX",
+      "group": "Example",
+      "aliases": [
+        "Example channel"
+      ],
+      "epg_ids": [],
+      "official_hosts": [
+        "example.invalid"
+      ]
+    }
+  ]
+}

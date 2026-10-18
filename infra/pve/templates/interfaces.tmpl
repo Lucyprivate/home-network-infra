@@ -1,0 +1,44 @@
+# Desired-state reference for a fresh host. Never overwrite a live file blindly.
+auto lo
+iface lo inet loopback
+
+# ETH0: router WAN. The hypervisor has no address on this bridge.
+iface enp2s0 inet manual
+auto vmbr0
+iface vmbr0 inet manual
+        bridge-ports enp2s0
+        bridge-stp off
+        bridge-fd 0
+        hwaddress ether {{PVE_PORT0_MAC}}
+
+# ETH1: isolated downstream LAN. Do not cable this port to the uplink LAN.
+iface enp3s0 inet manual
+auto vmbr1
+iface vmbr1 inet manual
+        bridge-ports enp3s0
+        bridge-stp off
+        bridge-fd 0
+        hwaddress ether {{PVE_PORT1_MAC}}
+
+# ETH2: daily management over the upstream router.
+iface enp4s0 inet manual
+auto vmbr2
+iface vmbr2 inet static
+        address {{PVE_UPLINK_IP}}/24
+        gateway {{UPLINK_GATEWAY}}
+        bridge-ports enp4s0
+        bridge-stp off
+        bridge-fd 0
+        hwaddress ether {{PVE_PORT2_MAC}}
+
+# ETH3: independent direct rescue. No default route or DNS from this cable.
+iface enp5s0 inet manual
+auto vmbr3
+iface vmbr3 inet static
+        address {{PVE_RESCUE_IP}}/24
+        bridge-ports enp5s0
+        bridge-stp off
+        bridge-fd 0
+        hwaddress ether {{PVE_PORT3_MAC}}
+
+source /etc/network/interfaces.d/*

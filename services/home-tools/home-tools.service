@@ -1,0 +1,22 @@
+[Unit]
+Description=Portainer FileBrowser Quantum and Homepage
+Requires=docker.service home-tools-guard.service
+After=docker.service home-tools-guard.service network-online.target
+Wants=network-online.target
+PartOf=docker.service
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/home-tools
+ExecStartPre=/usr/bin/python3 /srv/home-tools/tools/network_guard.py --check
+ExecStart=/usr/bin/docker compose -p home-tools -f /srv/home-tools/compose.yaml up --pull never --no-build --abort-on-container-exit
+ExecStop=/usr/bin/docker compose -p home-tools -f /srv/home-tools/compose.yaml stop --timeout 30
+Restart=always
+RestartSec=10
+TimeoutStartSec=150
+TimeoutStopSec=75
+
+[Install]
+WantedBy=multi-user.target docker.service

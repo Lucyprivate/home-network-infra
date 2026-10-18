@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Public HTTP availability snapshot. No credentials, media or response bodies."""
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+import json, os, ssl, tempfile, time, urllib.error, urllib.request
+from pathlib import Path
+DEST=Path('/srv/home-tools/homepage/public/health/status.json')
+URLS={
+ 'jellyfin':'http://{{APP_UPLINK_IP}}:8096/System/Info/Public',
+ 'stirling':'http://127.0.0.1:8080/api/v1/info/status',
+ 'filebrowser':'http://127.0.0.1:8081/health',
+ 'portainer':'https://127.0.0.1:9443/api/status',
+ 'pve':'https://{{PVE_IP}}:8006/',
+ 'openwrt':'http://{{LAN_GATEWAY}}/',
+}
+# The two HTTPS endpoints use existing private-network self-signed certificates.
+# No credentials or request payload are sent, and no response content is retained.
+def probe(item):
+ key,url=item;start=time.monotonic();code=None
+ opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+ try:
+  try:
+   with opener.open(urllib.request.Request(url,method='HEAD'),timeout=3) as response:code=response.status
+  except urllib.error.HTTPError as error:
+   code=error.code
+   if code in (405,501):
+    with opener.open(urllib.request.Request(url,headers={'Range':'bytes=0-511'}),timeout=3) as response:code=response.status;response.read(512)
+ except (urllib.error.URLError,TimeoutError,OSError):pass
+ ok=code is not None and 200<=code<400
+ return key,{'state':'Online' if ok else 'Offline','http_status':code,'latency_ms':round((time.monotonic()-start)*1000)}
+
+def write_snapshot(dest=DEST,urls=URLS):
+ with ThreadPoolExecutor(max_workers=3) as pool:states=dict(pool.map(probe,urls.items()))
+ data={'schema':1,'checked_at':datetime.now(timezone.utc).isoformat(),'services':states}
+ fd,tmp=tempfile.mkstemp(prefix='.status-',suffix='.tmp',dir=dest.parent)
+ try:
+  with os.fdopen(fd,'w') as output:
+   json.dump(data,output,sort_keys=True);output.write('\n');output.flush();os.fsync(output.fileno())
+  os.chmod(tmp,0o644);os.replace(tmp,dest)
+ finally:
+  if os.path.exists(tmp):os.unlink(tmp)
+ return data
+if __name__=='__main__':
+ data=write_snapshot();print(json.dumps({'checked_at':data['checked_at'],'services':{k:v['state'] for k,v in data['services'].items()}}))

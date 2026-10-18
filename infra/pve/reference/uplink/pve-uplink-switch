@@ -1,0 +1,664 @@
+#!/usr/bin/python3
+"""Router-first v2 PVE management activation with two timed rollback phases."""
+
+import argparse
+import base64
+import fcntl
+import json
+import os
+import re
+import select
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+LAYOUT = 'router-first-v2-management-vmbr2-rescue-vmbr3'
+UPLINK = 'enp4s0'  # ETH2 management; ETH0/1 stay dedicated to OpenWrt WAN/LAN.
+MAC = '02:00:00:00:10:02'
+MANAGEMENT = 'vmbr2'
+RESCUE = 'vmbr3'
+RESCUE_PORT = 'enp5s0'
+RESCUE_MAC = '02:00:00:00:10:03'
+PORTS = {'vmbr0': 'enp2s0', 'vmbr1': 'enp3s0', MANAGEMENT: UPLINK, RESCUE: RESCUE_PORT}
+NEW_IP = '10.10.10.10'
+NEW_GATEWAY = '10.10.10.1'
+RESCUE_IP = '10.10.99.10'
+INTERFACES = Path('/etc/network/interfaces')
+PENDING = Path('/etc/network/interfaces.new')
+RA_FILE = Path('/etc/sysctl.d/90-codex-pve-bridge-ra.conf')
+RESOLVER = Path('/etc/resolv.conf')
+HOSTS = Path('/etc/hosts')
+STATE_DIR = Path('/var/lib/codex-pve-uplink')
+UNITS = Path('/etc/systemd/system')
+SYSNET = Path('/sys/class/net')
+SYSCTL_DIR = Path('/proc/sys/net/ipv6/conf')
+BRIDGES = ('vmbr0', 'vmbr1', 'vmbr2', 'vmbr3')
+RA_INTERFACES = BRIDGES + (UPLINK, RESCUE_PORT)
+TIMEOUT = 300
+UNIT_PREFIX = 'codex-pve-uplink-v2-'
+PHASES = {'initial', 'stage-pending', 'stage-confirmed', 'commit-pending', 'committed'}
+
+
+class Refusal(Exception):
+    pass
+
+
+def run(argv, check=True, timeout=45):
+    try:
+        result = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise Refusal('Command timed out: ' + argv[0]) from None
+    if check and result.returncode:
+        raise Refusal('Command failed: ' + argv[0] + '; details: ' + result.stderr.strip()[:700])
+    return result
+
+
+def atomic_write(path, content, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.codex-tmp-' + uuid.uuid4().hex[:12])
+    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, 'wb') as target:
+            target.write(content.encode() if isinstance(content, str) else content)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def validate_state(state):
+    if not isinstance(state, dict) or state.get('layout') != LAYOUT or state.get('phase') not in PHASES:
+        raise Refusal('State belongs to an old or unknown network layout; archive it after reviewing old rollback units.')
+
+
+def layout_guard():
+    # An old snapshot can restore ETH2 as rescue even if state.json is absent.
+    # Do not silently adopt, overwrite or delete any prior transaction.
+    snapshots = STATE_DIR / 'snapshots'
+    if snapshots.exists():
+        for directory in snapshots.iterdir():
+            manifest_path = directory / 'snapshot.json'
+            if not directory.is_dir() or not manifest_path.is_file():
+                raise Refusal('Unversioned or incomplete snapshot exists; review/archive it before using v2.')
+            manifest = json.loads(manifest_path.read_text())
+            if manifest.get('layout') != LAYOUT:
+                raise Refusal('Snapshot belongs to an old or unknown layout; v2 will not restore it.')
+            validate_state(manifest.get('previous_state'))
+    for suffix in ('.timer', '.service'):
+        for unit in UNITS.glob('codex-pve-uplink-*' + suffix):
+            if not unit.name.startswith(UNIT_PREFIX) or '# layout=' + LAYOUT not in unit.read_text():
+                raise Refusal('Old or unversioned uplink rollback unit exists; resolve it before using v2.')
+
+
+def read_state():
+    layout_guard()
+    path = STATE_DIR / 'state.json'
+    state = json.loads(path.read_text()) if path.exists() else {'layout': LAYOUT, 'phase': 'initial'}
+    validate_state(state)
+    return state
+
+
+def save_state(state):
+    validate_state(state)
+    atomic_write(STATE_DIR / 'state.json', json.dumps(state, indent=2) + '\n')
+
+
+def ipv4_defaults():
+    return json.loads(run(['ip', '-j', '-4', 'route', 'show', 'default']).stdout)
+
+
+def require_default(bridge=None, gateway=None):
+    routes = ipv4_defaults()
+    if bridge is None and gateway is None:
+        if routes:
+            raise Refusal('Expected no IPv4 default route in the offline/staged layout.')
+        return
+    if len(routes) != 1 or routes[0].get('dev') != bridge or routes[0].get('gateway') != gateway:
+        raise Refusal('Expected exactly one IPv4 default via ' + gateway + ' dev ' + bridge + '.')
+
+
+def require_address(bridge, address):
+    interfaces = json.loads(run(['ip', '-j', '-4', 'addr', 'show', 'dev', bridge]).stdout)
+    if not any(item.get('local') == address and item.get('prefixlen') == 24
+               for interface in interfaces for item in interface.get('addr_info', [])):
+        raise Refusal('Expected address ' + address + '/24 on ' + bridge + '.')
+
+
+def require_no_address(bridge):
+    interfaces = json.loads(run(['ip', '-j', '-4', 'addr', 'show', 'dev', bridge]).stdout)
+    if any(interface.get('addr_info') for interface in interfaces):
+        raise Refusal('Expected no IPv4 address on ' + bridge + '.')
+
+
+def require_no_dns():
+    if re.search(r'^\s*nameserver\s+', RESOLVER.read_text(), re.MULTILINE):
+        raise Refusal('Expected no DNS nameserver in the offline/staged baseline.')
+
+
+def require_live_layout():
+    require_mac()
+    for port, bridge, mac in ((UPLINK, MANAGEMENT, MAC), (RESCUE_PORT, RESCUE, RESCUE_MAC)):
+        physical = SYSNET / port
+        master = physical / 'master'
+        if not master.is_symlink() or master.resolve().name != bridge:
+            raise Refusal('Expected ' + port + ' to belong only to ' + bridge + '.')
+        if (physical / 'address').read_text().strip().lower() != mac:
+            raise Refusal('Physical port MAC differs from the v2 layout.')
+        if not (SYSNET / bridge / 'address').exists() or (SYSNET / bridge / 'address').read_text().strip().lower() != mac:
+            raise Refusal('Bridge MAC differs from its v2 physical port; do not use an old reservation.')
+    require_address(RESCUE, RESCUE_IP)
+
+
+def require_mac():
+    sysnet = SYSNET / UPLINK
+    if not sysnet.exists() or (sysnet / 'address').read_text().strip().lower() != MAC:
+        raise Refusal('Management uplink device or its expected MAC does not match.')
+
+
+def uplink_is_up():
+    return bool(int((SYSNET / UPLINK / 'flags').read_text().strip(), 0) & 1)
+
+
+def require_link():
+    require_mac()
+    try:
+        carrier = (SYSNET / UPLINK / 'carrier').read_text().strip()
+    except OSError:
+        carrier = '0'
+    if carrier != '1':
+        raise Refusal('Management uplink has no carrier; connect the future router before staging.')
+
+
+def require_session(state=None):
+    session = os.environ.get('SSH_CONNECTION', '')
+    fields = session.split()
+    if len(fields) != 4 or fields[2] != NEW_IP:
+        raise Refusal('Use a new SSH connection to root@' + NEW_IP + ' for this command.')
+    if state and session == state.get('initiating_session'):
+        raise Refusal('Confirmation must use a new SSH connection, not the phase initiating connection.')
+    return session
+
+
+def arp_probe(conflict_ip, seconds=3.4):
+    """RFC 5227 style raw ARP probes; returns True if another MAC claims IP."""
+    own = bytes.fromhex(MAC.replace(':', ''))
+    target = socket.inet_aton(conflict_ip)
+    ethernet = b'\xff' * 6 + own + struct.pack('!H', 0x0806)
+    arp = struct.pack('!HHBBH', 1, 0x0800, 6, 4, 1) + own + b'\x00' * 4 + b'\x00' * 6 + target
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806)) as raw:
+        raw.bind((UPLINK, 0))
+        deadline = time.monotonic() + seconds
+        next_probe = time.monotonic()
+        sent = 0
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if sent < 3 and now >= next_probe:
+                raw.send(ethernet + arp)
+                sent += 1
+                next_probe = now + 1.0
+            readable, _, _ = select.select([raw], [], [], min(0.2, max(0, deadline - now)))
+            if not readable:
+                continue
+            packet = raw.recv(2048)
+            if len(packet) < 42 or packet[12:14] != b'\x08\x06' or packet[14:20] != b'\x00\x01\x08\x00\x06\x04':
+                continue
+            operation = struct.unpack('!H', packet[20:22])[0]
+            sender_mac, sender_ip, target_ip = packet[22:28], packet[28:32], packet[38:42]
+            if sender_mac == own or operation not in (1, 2):
+                continue
+            if sender_ip == target or (operation == 1 and sender_ip == b'\x00' * 4 and target_ip == target):
+                return True
+    return False
+
+
+def current_stanzas(text):
+    stanzas = []
+    for match in re.finditer(r'^iface\s+(\S+)\s+(inet6?)\s+(\S+)[^\n]*\n', text, re.MULTILINE):
+        next_header = re.search(r'^(?:iface|auto|allow-\S+|source|source-directory|mapping)\s', text[match.end():], re.MULTILINE)
+        end = match.end() + next_header.start() if next_header else len(text)
+        stanzas.append((match.group(1), match.group(2), match.group(3), match.start(), end))
+    return stanzas
+
+
+def list_interfaces(path):
+    return run(['ifquery', '-i', str(path), '--list']).stdout.split()
+
+
+def require_config_layout(text, phase):
+    stanzas = current_stanzas(text)
+    for bridge, port in PORTS.items():
+        matches = [s for s in stanzas if s[0] == bridge and s[1] == 'inet']
+        if len(matches) != 1:
+            raise Refusal('Expected one existing inet stanza for ' + bridge + '.')
+        _, _, method, start, end = matches[0]
+        block = text[start:end]
+        ports = re.findall(r'^\s+bridge-ports\s+([^\n]+)', block, re.MULTILINE)
+        if len(ports) != 1 or ports[0].split() != [port]:
+            raise Refusal('Bridge physical ports differ from the router-first v2 layout.')
+        addresses = re.findall(r'^\s+address\s+(\S+)', block, re.MULTILINE)
+        expected_method = 'static' if bridge == RESCUE or (bridge == MANAGEMENT and phase != 'initial') else 'manual'
+        expected_addresses = [RESCUE_IP + '/24'] if bridge == RESCUE else [NEW_IP + '/24'] if bridge == MANAGEMENT and phase != 'initial' else []
+        if method != expected_method or addresses != expected_addresses:
+            raise Refusal('Bridge addressing differs from the expected ' + phase + ' layout.')
+    # No port may also be used by an unexpected bridge stanza.
+    for name, family, method, start, end in stanzas:
+        ports = re.findall(r'^\s+bridge-ports\s+([^\n]+)', text[start:end], re.MULTILINE)
+        for configured in ports:
+            for port in PORTS.values():
+                if port in configured.split() and PORTS.get(name) != port:
+                    raise Refusal('A v2 physical port is also assigned to an unexpected bridge.')
+    gateways = re.findall(r'^\s*gateway\s+(\S+)', text, re.MULTILINE)
+    if gateways != ([NEW_GATEWAY] if phase == 'committed' else []):
+        raise Refusal('Configured gateways differ from the offline/staged v2 layout.')
+    for name, family, method, start, end in stanzas:
+        if re.search(r'^\s*gateway\s+', text[start:end], re.MULTILINE) and (name != MANAGEMENT or family != 'inet'):
+            raise Refusal('The default gateway must belong only to ' + MANAGEMENT + '.')
+
+
+def stage_candidate(original):
+    require_config_layout(original, 'initial')
+    stanza = next(s for s in current_stanzas(original) if s[0] == MANAGEMENT and s[1] == 'inet')
+    header_end = original.index('\n', stanza[3]) + 1
+    header = re.sub(r'\binet\s+manual\b', 'inet static', original[stanza[3]:header_end], count=1)
+    candidate = original[:stanza[3]] + header + '    address ' + NEW_IP + '/24\n' + original[header_end:]
+    require_config_layout(candidate, 'stage-confirmed')
+    return candidate
+
+
+def commit_candidate(original):
+    require_config_layout(original, 'stage-confirmed')
+    stanza = next(s for s in current_stanzas(original) if s[0] == MANAGEMENT and s[1] == 'inet')
+    header_end = original.index('\n', stanza[3]) + 1
+    candidate = original[:header_end] + '    gateway ' + NEW_GATEWAY + '\n' + original[header_end:]
+    require_config_layout(candidate, 'committed')
+    return candidate
+
+
+def dns_candidate(original):
+    preserved = [line for line in original.splitlines() if not re.match(r'^\s*nameserver\s', line)]
+    return '\n'.join(preserved + ['nameserver ' + NEW_GATEWAY]) + '\n'
+
+
+def direct_dns_probe(server):
+    identifier = struct.pack('!H', int.from_bytes(os.urandom(2), 'big'))
+    query = identifier + b'\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+    query += b'\x03deb\x06debian\x03org\x00\x00\x01\x00\x01'
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            client.settimeout(3)
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, (MANAGEMENT + '\x00').encode())
+            client.bind((NEW_IP, 0))
+            client.sendto(query, (server, 53))
+            response, remote = client.recvfrom(4096)
+            return (remote[0] == server and len(response) >= 12 and response[:2] == identifier
+                    and response[2] & 0x80 and response[3] & 0x0f == 0
+                    and struct.unpack('!H', response[6:8])[0] > 0)
+    except OSError:
+        return False
+
+
+def hosts_candidate(original):
+    result = []
+    for line in original.splitlines():
+        body, separator, comment = line.partition('#')
+        words = body.split()
+        if len(words) > 1:
+            aliases = [word for word in words[1:] if word not in ('pve', 'hypervisor.example.test')]
+            if len(aliases) != len(words[1:]):
+                if aliases:
+                    result.append(words[0] + '\t' + ' '.join(aliases) + (' #' + comment if separator else ''))
+                elif separator:
+                    result.append('#' + comment)
+                continue
+        result.append(line)
+    result.append('10.10.10.10\thypervisor.example.test pve')
+    return '\n'.join(result) + '\n'
+
+
+def ra_content():
+    return '# Only PVE bridges and management/rescue physical ports; IPv6 remains enabled.\n' + ''.join(
+        'net.ipv6.conf.' + interface + '.' + key + '=0\n'
+        for interface in RA_INTERFACES for key in ('accept_ra', 'accept_ra_defrtr'))
+
+
+def capture_ra(interfaces):
+    values = {}
+    for interface in interfaces:
+        for key in ('accept_ra', 'accept_ra_defrtr'):
+            path = SYSCTL_DIR / interface / key
+            if path.exists():
+                values[str(path)] = path.read_text().strip()
+    return values
+
+
+def pending_guard():
+    if PENDING.exists() and PENDING.read_bytes() != INTERFACES.read_bytes():
+        raise Refusal('interfaces.new contains a pending, different GUI configuration; resolve it before migration.')
+
+
+def snapshot_file(path):
+    if path.is_symlink():
+        return {'kind': 'symlink', 'target': os.readlink(path)}
+    if not path.exists():
+        return {'kind': 'missing'}
+    if not path.is_file():
+        raise Refusal('Expected ordinary configuration file: ' + str(path))
+    return {'kind': 'file', 'content': base64.b64encode(path.read_bytes()).decode(), 'mode': stat.S_IMODE(path.stat().st_mode)}
+
+
+def snapshot(previous, transaction, original_uplink_up=None, original_uplink_sysctls=None):
+    validate_state(previous)
+    directory = STATE_DIR / 'snapshots' / transaction
+    directory.mkdir(parents=True, mode=0o700)
+    files = {str(path): snapshot_file(path) for path in (INTERFACES, PENDING, RA_FILE, RESOLVER, HOSTS)}
+    sysctls = capture_ra(RA_INTERFACES)
+    sysctls.update(original_uplink_sysctls or {})
+    ra_routes = [r for r in json.loads(run(['ip', '-j', '-6', 'route', 'show', 'default']).stdout)
+                 if r.get('dev') in RA_INTERFACES and r.get('protocol') == 'ra']
+    manifest = {'layout': LAYOUT, 'previous_state': previous, 'files': files, 'sysctls': sysctls, 'ra_routes': ra_routes,
+                'uplink_was_up': uplink_is_up() if original_uplink_up is None else original_uplink_up}
+    atomic_write(directory / 'snapshot.json', json.dumps(manifest, indent=2) + '\n')
+    return directory
+
+
+def cleanup_timer(transaction, stop_service=False):
+    unit = UNIT_PREFIX + transaction
+    run(['systemctl', 'disable', '--now', unit + '.timer'], check=False)
+    if stop_service:
+        run(['systemctl', 'stop', unit + '.service'], check=False)
+    for suffix in ('.timer', '.service'):
+        (UNITS / (unit + suffix)).unlink(missing_ok=True)
+    (Path('/var/lib/systemd/timers') / ('stamp-' + unit + '.timer')).unlink(missing_ok=True)
+    run(['systemctl', 'daemon-reload'], check=False)
+    run(['systemctl', 'reset-failed', unit + '.service'], check=False)
+
+
+def arm_timer(transaction):
+    unit = UNIT_PREFIX + transaction
+    executable = str(Path(__file__).resolve())
+    if any(character.isspace() for character in executable):
+        raise Refusal('Install the script at a path without spaces before migration.')
+    deadline = datetime.fromtimestamp(time.time() + TIMEOUT, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    marker = '# layout=' + LAYOUT + '\n'
+    service = marker + '[Unit]\nDescription=Rollback unconfirmed PVE management migration v2\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\nExecStart=' + executable + ' rollback --transaction ' + transaction + '\nTimeoutStartSec=180\nRestart=on-failure\nRestartSec=15s\n'
+    timer = marker + '[Unit]\nDescription=300 second PVE management confirmation deadline v2\n[Timer]\nOnActiveSec=300s\nOnCalendar=' + deadline + '\nPersistent=true\nAccuracySec=1s\nUnit=' + unit + '.service\n[Install]\nWantedBy=timers.target\n'
+    atomic_write(UNITS / (unit + '.service'), service, 0o644)
+    atomic_write(UNITS / (unit + '.timer'), timer, 0o644)
+    try:
+        run(['systemctl', 'daemon-reload'])
+        run(['systemctl', 'enable', '--now', unit + '.timer'])
+        if run(['systemctl', 'is-active', unit + '.timer'], check=False).returncode:
+            raise Refusal('Rollback timer did not activate.')
+    except Exception:
+        cleanup_timer(transaction)
+        raise
+
+
+def apply_ra():
+    for bridge in RA_INTERFACES:
+        for key in ('accept_ra', 'accept_ra_defrtr'):
+            path = SYSCTL_DIR / bridge / key
+            if path.exists():
+                path.write_text('0\n')
+    for route in json.loads(run(['ip', '-j', '-6', 'route', 'show', 'default']).stdout):
+        if route.get('dev') in RA_INTERFACES and route.get('protocol') == 'ra':
+            command = ['ip', '-6', 'route', 'del', 'default']
+            if route.get('gateway'):
+                command += ['via', route['gateway']]
+            command += ['dev', route['dev'], 'proto', 'ra']
+            run(command)
+
+
+def restore_snapshot(transaction, stop_service=False):
+    manifest = json.loads((STATE_DIR / 'snapshots' / transaction / 'snapshot.json').read_text())
+    if manifest.get('layout') != LAYOUT:
+        raise Refusal('Refusing to restore an old/unknown network layout snapshot.')
+    validate_state(manifest.get('previous_state'))
+    expected_files = {str(path) for path in (INTERFACES, PENDING, RA_FILE, RESOLVER, HOSTS)}
+    if set(manifest['files']) != expected_files:
+        raise Refusal('Snapshot configuration targets differ from this v2 tool.')
+    previous_phase = manifest['previous_state']['phase']
+    if previous_phase not in ('initial', 'stage-confirmed'):
+        raise Refusal('Unexpected rollback baseline phase.')
+    original = manifest['files'][str(INTERFACES)]
+    if original['kind'] != 'file':
+        raise Refusal('Snapshot does not contain an ordinary interfaces baseline.')
+    require_config_layout(base64.b64decode(original['content']).decode(), previous_phase)
+    for filename, record in manifest['files'].items():
+        path = Path(filename)
+        if record['kind'] == 'file':
+            atomic_write(path, base64.b64decode(record['content']), record['mode'])
+        elif record['kind'] == 'missing':
+            path.unlink(missing_ok=True)
+        else:
+            path.unlink(missing_ok=True)
+            os.symlink(record['target'], path)
+    run(['ifreload', '-a'])
+    for filename, value in manifest['sysctls'].items():
+        path = Path(filename)
+        if path.exists():
+            path.write_text(value + '\n')
+    for route in manifest['ra_routes']:
+        command = ['ip', '-6', 'route', 'add', 'default']
+        if route.get('gateway'):
+            command += ['via', route['gateway']]
+        command += ['dev', route['dev'], 'proto', 'ra']
+        if 'metric' in route:
+            command += ['metric', str(route['metric'])]
+        run(command, check=False)
+    if not manifest['uplink_was_up']:
+        run(['ip', 'link', 'set', 'dev', UPLINK, 'down'])
+    require_default()
+    require_no_dns()
+    require_live_layout()
+    if previous_phase == 'stage-confirmed':
+        require_address(MANAGEMENT, NEW_IP)
+    else:
+        require_no_address(MANAGEMENT)
+    # Keep the rollback service and pending state intact if restore/reload or
+    # verification fails; the service will retry independently after 15s.
+    save_state(manifest['previous_state'])
+    cleanup_timer(transaction, stop_service)
+
+
+def validate_candidate(path, original_devices):
+    devices = list_interfaces(path)
+    if any(devices.count(bridge) != 1 for bridge in BRIDGES) or set(devices) != set(original_devices):
+        raise Refusal('Candidate lost, added or duplicated existing v2 interface names.')
+
+
+def begin_phase(phase, state, candidate, original_uplink_up=None, original_uplink_sysctls=None):
+    validate_state(state)
+    require_config_layout(candidate, 'stage-confirmed' if phase == 'stage' else 'committed')
+    transaction = phase + '-' + uuid.uuid4().hex[:12]
+    directory = snapshot(state, transaction, original_uplink_up, original_uplink_sysctls)
+    candidate_path = directory / 'interfaces.candidate'
+    atomic_write(candidate_path, candidate)
+    validate_candidate(candidate_path, list_interfaces(INTERFACES))
+    next_state = {'layout': LAYOUT, 'phase': phase + '-pending', 'transaction': transaction,
+                  'initiating_session': os.environ.get('SSH_CONNECTION', ''),
+                  'deadline_unix': int(time.time()) + TIMEOUT, 'previous_phase': state['phase']}
+    if phase == 'commit':
+        next_state['stage_snapshot'] = state['stage_snapshot']
+    # Timer and pending state are committed before the first network mutation.
+    save_state(next_state)
+    try:
+        arm_timer(transaction)
+    except Exception:
+        save_state(state)
+        raise
+    try:
+        PENDING.unlink(missing_ok=True)
+        atomic_write(INTERFACES, candidate, stat.S_IMODE(INTERFACES.stat().st_mode))
+        atomic_write(RA_FILE, ra_content(), 0o644)
+        apply_ra()
+        if phase == 'commit':
+            atomic_write(RESOLVER, dns_candidate(RESOLVER.read_text()), stat.S_IMODE(RESOLVER.stat().st_mode))
+            atomic_write(HOSTS, hosts_candidate(HOSTS.read_text()), stat.S_IMODE(HOSTS.stat().st_mode))
+        run(['ifreload', '-a'])
+        apply_ra()
+        require_default() if phase == 'stage' else require_default(MANAGEMENT, NEW_GATEWAY)
+        require_address(MANAGEMENT, NEW_IP)
+        require_live_layout()
+        if phase == 'stage':
+            require_no_dns()
+    except Exception:
+        restore_snapshot(transaction)
+        raise
+    print(json.dumps({'layout': LAYOUT, 'phase': next_state['phase'], 'management_address': NEW_IP,
+                      'confirmation_deadline_seconds': TIMEOUT, 'vm_changes': False}))
+
+
+def status(state):
+    print(json.dumps({'layout': LAYOUT, 'management_bridge': MANAGEMENT, 'management_port': UPLINK,
+                      'management_mac': MAC, 'rescue_bridge': RESCUE, 'rescue_address': RESCUE_IP,
+                      'state': state, 'ipv4_defaults': ipv4_defaults(),
+                      'pending_gui_config': PENDING.exists()}, indent=2))
+
+
+def execute(args):
+    state = read_state()
+    if args.command == 'status':
+        status(state)
+        return
+    if args.command == 'rollback':
+        transaction = args.transaction or state.get('transaction') or state.get('commit_snapshot') or state.get('stage_snapshot')
+        if not transaction:
+            raise Refusal('No migration snapshot is available to roll back.')
+        if args.transaction and (state.get('transaction') != args.transaction or not state['phase'].endswith('-pending')):
+            print('Rollback transaction is no longer pending; no changes applied.')
+            cleanup_timer(args.transaction)
+            return
+        restore_snapshot(transaction, stop_service=not bool(args.transaction))
+        print('Restored the snapshot for this migration phase.')
+        return
+    if args.command == 'stage':
+        if not args.address_reserved:
+            raise Refusal('Stage requires --address-reserved after excluding or reserving 10.10.10.10 on the router.')
+        if state['phase'] != 'initial':
+            raise Refusal('Stage is only allowed from the initial state.')
+        require_mac()
+        require_default()
+        require_no_dns()
+        require_live_layout()
+        require_no_address(MANAGEMENT)
+        require_no_address(UPLINK)
+        pending_guard()
+        original = INTERFACES.read_text()
+        candidate = stage_candidate(original)
+        original_up = uplink_is_up()
+        original_ra = capture_ra((UPLINK,))
+        phase_started = False
+        try:
+            # Stop unsolicited physical-port RA before the UP transition; keep
+            # its original runtime values in the successful phase snapshot.
+            for filename in original_ra:
+                Path(filename).write_text('0\n')
+            # ETH2 can be administratively down. Its existing v2 bridge and
+            # lack of any IPv4 address were verified above; touch only this port.
+            if not original_up:
+                run(['ip', 'link', 'set', 'dev', UPLINK, 'up'])
+                for _ in range(15):
+                    try:
+                        require_link()
+                        break
+                    except Refusal:
+                        time.sleep(0.2)
+            require_link()
+            if arp_probe(NEW_IP):
+                raise Refusal('Another device is claiming 10.10.10.10; no address or configuration was added.')
+            begin_phase('stage', state, candidate, original_uplink_up=original_up,
+                        original_uplink_sysctls=original_ra)
+            phase_started = True
+        finally:
+            if not original_up and not phase_started:
+                run(['ip', 'link', 'set', 'dev', UPLINK, 'down'], check=False)
+            if not phase_started:
+                for filename, value in original_ra.items():
+                    Path(filename).write_text(value + '\n')
+        return
+    if args.command in ('confirm-stage', 'confirm-commit'):
+        expected = args.command.removeprefix('confirm-')
+        if state['phase'] != expected + '-pending':
+            raise Refusal('No matching phase is awaiting confirmation.')
+        require_session(state)
+        require_link()
+        require_live_layout()
+        require_address(MANAGEMENT, NEW_IP)
+        pending_guard()
+        if time.time() >= state['deadline_unix']:
+            raise Refusal('Confirmation deadline has passed; the scheduled rollback must complete.')
+        if expected == 'stage':
+            require_default()
+            require_no_dns()
+            require_config_layout(INTERFACES.read_text(), 'stage-confirmed')
+            next_state = {'layout': LAYOUT, 'phase': 'stage-confirmed', 'stage_snapshot': state['transaction']}
+        else:
+            require_default(MANAGEMENT, NEW_GATEWAY)
+            require_config_layout(INTERFACES.read_text(), 'committed')
+            nameservers = re.findall(r'^\s*nameserver\s+(\S+)', RESOLVER.read_text(), re.MULTILINE)
+            if nameservers != [NEW_GATEWAY]:
+                raise Refusal('DNS nameservers differ from the requested direct upstream configuration.')
+            probes = [direct_dns_probe(server) for server in nameservers]
+            if not any(probes) or not run(['getent', 'ahostsv4', 'deb.debian.org'], timeout=15).stdout.strip():
+                raise Refusal('Direct upstream DNS and system DNS resolution did not pass.')
+            for hostname in ('pve', 'hypervisor.example.test'):
+                addresses = {line.split()[0] for line in run(['getent', 'ahostsv4', hostname]).stdout.splitlines() if line.split()}
+                if addresses != {NEW_IP}:
+                    raise Refusal('Host name does not resolve solely to the new management address.')
+            next_state = {'layout': LAYOUT, 'phase': 'committed', 'stage_snapshot': state['stage_snapshot'], 'commit_snapshot': state['transaction']}
+        # Change state under the lock first, so an already queued timer cannot revert a confirmed phase.
+        save_state(next_state)
+        cleanup_timer(state['transaction'], stop_service=True)
+        print(json.dumps({'phase': next_state['phase'], 'rollback_timer_removed': True}))
+        return
+    if args.command == 'commit':
+        if state['phase'] != 'stage-confirmed':
+            raise Refusal('Commit requires a confirmed staged management connection.')
+        require_session()
+        require_link()
+        require_live_layout()
+        require_address(MANAGEMENT, NEW_IP)
+        require_default()
+        require_no_dns()
+        pending_guard()
+        if Path('/etc/pve/corosync.conf').exists() or socket.gethostname().split('.')[0] != 'pve':
+            raise Refusal('Hosts migration is restricted to this single PVE node named pve.')
+        if RESOLVER.is_symlink() or HOSTS.is_symlink() or INTERFACES.is_symlink():
+            raise Refusal('Externally managed or symbolic configuration files require manual review.')
+        begin_phase('commit', state, commit_candidate(INTERFACES.read_text()))
+        return
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['status', 'stage', 'confirm-stage', 'commit', 'confirm-commit', 'rollback'])
+    parser.add_argument('--address-reserved', action='store_true')
+    parser.add_argument('--transaction', help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.transaction and not re.fullmatch(r'(stage|commit)-[0-9a-f]{12}', args.transaction):
+        raise Refusal('Invalid rollback transaction identifier.')
+    if os.geteuid() != 0:
+        raise Refusal('Run this migration tool as root on PVE.')
+    os.umask(0o077)
+    STATE_DIR.mkdir(parents=True, mode=0o700, exist_ok=True)
+    with (STATE_DIR / 'lock').open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        execute(args)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (Refusal, OSError, ValueError) as error:
+        print('Refused: ' + str(error), file=sys.stderr)
+        sys.exit(1)

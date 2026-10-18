@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Install Docker Engine on a fresh Ubuntu VM; never remove existing workloads.
+
+Run as root. Private receipts retain previous configuration. A failed daemon
+change restores its previous JSON, but does not uninstall packages or erase data.
+"""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+
+PACKAGES = ["docker-ce", "docker-ce-cli", "containerd.io",
+            "docker-buildx-plugin", "docker-compose-plugin"]
+CONFLICTS = ["docker.io", "docker-compose", "docker-compose-v2", "docker-doc",
+             "docker-buildx", "podman-docker", "containerd", "runc"]
+MIN_FREE = 5 * 1024 ** 3
+SUPPORTED = {"22.04": "jammy", "24.04": "noble", "26.04": "resolute"}
+
+
+def stamp():
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+class Refused(RuntimeError):
+    pass
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise Refused("Run this script as root.")
+
+
+def private_directory(path):
+    path = Path(path).absolute()
+    for part in [*reversed(path.parents), path]:
+        if part.exists() or part.is_symlink():
+            info = part.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise Refused("Directory path contains a symlink or non-directory.")
+            if info.st_uid != 0:
+                raise Refused("Private directory ancestors must be root-owned.")
+        else:
+            part.mkdir(mode=0o700)
+    os.chmod(path, 0o700)
+    return path
+
+
+def allowed_state_directory(path):
+    if ".." in Path(path).parts:
+        raise Refused("State directory must not contain parent traversal.")
+    path = Path(path).absolute()
+    if path != Path("/var/lib/servicehost-setup") and Path("/var/lib/servicehost-setup") not in path.parents:
+        raise Refused("State directory must be within /var/lib/servicehost-setup.")
+    return private_directory(path)
+
+
+def atomic_bytes(path, data, mode=0o600):
+    path = Path(path)
+    if path.is_symlink():
+        raise Refused("Refusing to replace a symlink.")
+    fd, temp = tempfile.mkstemp(prefix=".docker-setup-", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        folder = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(folder)
+        finally:
+            os.close(folder)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def save_json(path, value):
+    atomic_bytes(path, (json.dumps(value, indent=2, sort_keys=True) + "\n").encode())
+
+
+def read_os_release(path="/etc/os-release"):
+    values = {}
+    for line in Path(path).read_text().splitlines():
+        if "=" not in line or line.lstrip().startswith("#"):
+            continue
+        key, value = line.split("=", 1)
+        parsed = shlex.split(value, posix=True)
+        values[key] = parsed[0] if len(parsed) == 1 else value
+    version = values.get("VERSION_ID")
+    codename = values.get("UBUNTU_CODENAME", values.get("VERSION_CODENAME"))
+    if values.get("ID") != "ubuntu" or SUPPORTED.get(version) != codename:
+        raise Refused("Ubuntu release must be a verified supported 22.04/24.04/26.04 release.")
+    return version, codename
+
+
+def merge_daemon(previous):
+    if not isinstance(previous, dict):
+        raise Refused("Existing daemon.json must contain a JSON object.")
+    merged = dict(previous)
+    options = previous.get("log-opts", {})
+    if not isinstance(options, dict):
+        raise Refused("Existing log-opts must be a JSON object.")
+    if set(options) - {"max-size", "max-file", "compress"}:
+        raise Refused("Existing logging options need review before changing the logging driver.")
+    merged["dns"] = ["10.10.20.1"]
+    merged["log-driver"] = "local"
+    merged["log-opts"] = {**options, "max-size": "10m", "max-file": "3"}
+    return merged
+
+
+class Commands:
+    def __init__(self, log):
+        self.log = Path(log)
+
+    def run(self, args, *, check=True, timeout=120):
+        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive", LC_ALL="C")
+        result = subprocess.run(args, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env, timeout=timeout)
+        with self.log.open("a") as handle:
+            handle.write(f"\n[{stamp()}] {shlex.join(args)}\n")
+            handle.write(result.stdout)
+            handle.write(result.stderr)
+            handle.write(f"\nreturncode={result.returncode}\n")
+        os.chmod(self.log, 0o600)
+        if check and result.returncode:
+            raise Refused(f"{Path(args[0]).name} failed with code {result.returncode}; inspect the private log.")
+        return result
+
+
+def installed_packages(commands, names):
+    result = commands.run(["dpkg-query", "-W", "-f=${Package}\t${Status}\t${Version}\n", *names], check=False)
+    found = {}
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) == 3 and fields[1] == "install ok installed":
+            found[fields[0]] = fields[2]
+    return found
+
+
+def assert_no_workloads(commands):
+    if shutil.which("docker"):
+        reachable = commands.run(["docker", "info", "--format", "{{.ServerVersion}}"], check=False).returncode == 0
+        if reachable:
+            swarm = commands.run(["docker", "info", "--format", "{{.Swarm.LocalNodeState}}"]).stdout.strip()
+            if swarm not in ("", "inactive"):
+                raise Refused("An existing Docker Swarm configuration requires review; no changes made.")
+            if commands.run(["docker", "plugin", "ls", "--quiet"]).stdout.strip():
+                raise Refused("Existing Docker plugins require review; no changes made.")
+            for args in (["docker", "ps", "-aq"], ["docker", "image", "ls", "-q"],
+                         ["docker", "volume", "ls", "-q"]):
+                if commands.run(args).stdout.strip():
+                    raise Refused("Existing Docker containers, images, or volumes require review; no changes made.")
+            networks = commands.run(["docker", "network", "ls", "--format", "{{.Name}}"]).stdout.splitlines()
+            if set(networks) - {"bridge", "host", "none"}:
+                raise Refused("Existing custom Docker networks require review; no changes made.")
+        else:
+            for path in (Path("/var/lib/docker"), Path("/var/lib/containerd")):
+                if path.exists() and any(path.iterdir()):
+                    raise Refused("Docker is unavailable but existing runtime data is present; inspect it first.")
+    else:
+        for path in (Path("/var/lib/docker"), Path("/var/lib/containerd")):
+            if path.exists() and any(path.iterdir()):
+                raise Refused("Existing runtime data requires review before installation.")
+    if shutil.which("ctr"):
+        result = commands.run(["ctr", "namespaces", "list", "-q"], check=False, timeout=15)
+        if result.returncode == 0 and set(result.stdout.splitlines()) - {"moby", "plugins.moby"}:
+            raise Refused("A non-Docker containerd namespace exists; review its workloads first.")
+        if result.returncode == 0:
+            for namespace in result.stdout.splitlines():
+                if commands.run(["ctr", "--namespace", namespace, "containers", "list", "--quiet"], timeout=15).stdout.strip():
+                    raise Refused("Existing containerd workloads require review; no changes made.")
+
+
+def backup_file(path, directory, name):
+    path = Path(path)
+    if path.is_symlink():
+        raise Refused("Configuration path is a symlink; inspect it first.")
+    if not path.exists():
+        return {"existed": False}
+    data = path.read_bytes()
+    atomic_bytes(directory / name, data)
+    return {"existed": True, "sha256": hashlib.sha256(data).hexdigest(),
+            "mode": stat.S_IMODE(path.stat().st_mode)}
+
+
+def install(args):
+    require_root()
+    version, codename = read_os_release()
+    root_free = shutil.disk_usage("/").free
+    if root_free < MIN_FREE:
+        raise Refused("Root filesystem has less than 5 GiB free.")
+    state_root = allowed_state_directory(args.state_dir)
+    directory = private_directory(state_root / ("install-" + uuid.uuid4().hex[:12]))
+    commands = Commands(directory / "commands.log")
+    if commands.run(["dpkg", "--print-architecture"]).stdout.strip() != "amd64":
+        raise Refused("This service host VM script expects amd64.")
+    conflicting = installed_packages(commands, CONFLICTS)
+    if conflicting:
+        raise Refused("Conflicting distribution container packages exist; review them before installation.")
+    assert_no_workloads(commands)
+    # Do not create duplicate Docker sources with competing Signed-By entries.
+    source_paths = [Path("/etc/apt/sources.list"), *Path("/etc/apt/sources.list.d").glob("*.list"),
+                    *Path("/etc/apt/sources.list.d").glob("*.sources")]
+    for source_path in source_paths:
+        if source_path == Path("/etc/apt/sources.list.d/docker.sources") or not source_path.is_file():
+            continue
+        if "download.docker.com/linux/ubuntu" in source_path.read_text(errors="replace"):
+            raise Refused("A separate Docker apt source already exists; review it before adding a new source.")
+    daemon = Path("/etc/docker/daemon.json")
+    previous = json.loads(daemon.read_text()) if daemon.exists() else {}
+    candidate = merge_daemon(previous)
+    receipt = {"schema": 1, "started_at": stamp(), "stage": "preflight_passed",
+               "ubuntu_version": version, "codename": codename,
+               "root_free_before_bytes": root_free, "files": {}}
+    for path, name in ((daemon, "daemon.previous.json"),
+                       (Path("/etc/apt/sources.list.d/docker.sources"), "docker.sources.previous"),
+                       (Path("/etc/apt/keyrings/docker.asc"), "docker.asc.previous")):
+        receipt["files"][str(path)] = backup_file(path, directory, name)
+    save_json(directory / "receipt.json", receipt)
+    candidate_path = directory / "daemon.candidate.json"
+    save_json(candidate_path, candidate)
+    daemon_written = False
+    try:
+        commands.run(["apt-get", "update"], timeout=900)
+        commands.run(["apt-get", "install", "-y", "--no-install-recommends", "ca-certificates", "curl"], timeout=900)
+        for path in (Path("/etc/apt/keyrings"), Path("/etc/docker")):
+            if path.is_symlink():
+                raise Refused("System configuration directory is a symlink.")
+            path.mkdir(mode=0o755, exist_ok=True)
+        commands.run(["curl", "--fail", "--silent", "--show-error", "--location",
+                      "--proto", "=https", "--tlsv1.2", "--max-time", "30",
+                      "https://download.docker.com/linux/ubuntu/gpg", "--output", str(directory / "docker.asc")])
+        key_data = (directory / "docker.asc").read_bytes()
+        if b"BEGIN PGP PUBLIC KEY BLOCK" not in key_data or len(key_data) > 65536:
+            raise Refused("Downloaded repository key is not an expected armored public key.")
+        atomic_bytes("/etc/apt/keyrings/docker.asc", key_data, 0o644)
+        source = ("Types: deb\nURIs: https://download.docker.com/linux/ubuntu\n"
+                  f"Suites: {codename}\nComponents: stable\nArchitectures: amd64\n"
+                  "Signed-By: /etc/apt/keyrings/docker.asc\n")
+        atomic_bytes("/etc/apt/sources.list.d/docker.sources", source.encode(), 0o644)
+        commands.run(["apt-get", "update"], timeout=900)
+        commands.run(["apt-get", "install", "-y", "--no-install-recommends", *PACKAGES], timeout=900)
+        receipt["stage"] = "packages_installed"
+        save_json(directory / "receipt.json", receipt)
+        # A package operation may take time. Recheck for concurrently created
+        # workloads and configuration changes before restarting the daemon.
+        assert_no_workloads(commands)
+        old_daemon = receipt["files"][str(daemon)]
+        if old_daemon["existed"]:
+            if not daemon.exists() or hashlib.sha256(daemon.read_bytes()).hexdigest() != old_daemon["sha256"]:
+                raise Refused("Daemon configuration changed during package installation; no daemon overwrite performed.")
+        elif daemon.exists() or daemon.is_symlink():
+            raise Refused("A daemon configuration appeared during installation; inspect it before applying changes.")
+        commands.run(["dockerd", "--validate", "--config-file", str(candidate_path)])
+        previous_mode = receipt["files"][str(daemon)].get("mode", 0o644)
+        atomic_bytes(daemon, candidate_path.read_bytes(), previous_mode)
+        daemon_written = True
+        commands.run(["systemctl", "enable", "docker.service", "containerd.service"])
+        commands.run(["systemctl", "restart", "docker.service"], timeout=120)
+        commands.run(["systemctl", "is-active", "docker.service", "containerd.service"])
+        commands.run(["systemctl", "is-enabled", "docker.service", "containerd.service"])
+        info = json.loads(commands.run(["docker", "info", "--format", "{{json .}}"]).stdout)
+        if info.get("LoggingDriver") != "local":
+            raise Refused("Docker did not apply the local logging driver.")
+        root_free_after = shutil.disk_usage("/").free
+        if root_free_after < MIN_FREE:
+            raise Refused("Installation left less than 5 GiB free; no images were pulled.")
+        receipt.update({"stage": "complete", "completed_at": stamp(),
+                        "package_versions": installed_packages(commands, PACKAGES),
+                        "docker_version": info.get("ServerVersion"),
+                        "storage_driver": info.get("Driver"),
+                        "logging_driver": info.get("LoggingDriver"),
+                        "root_free_after_bytes": root_free_after,
+                        "daemon_sha256": hashlib.sha256(daemon.read_bytes()).hexdigest()})
+        save_json(directory / "receipt.json", receipt)
+        save_json(state_root / "latest-install.json", receipt)
+        print(json.dumps({"status": "INSTALLED", "receipt": str(directory / "receipt.json"),
+                          "ubuntu_version": version, "docker_version": info.get("ServerVersion"),
+                          "root_free_bytes": root_free_after}))
+    except BaseException as error:
+        if daemon_written:
+            old = receipt["files"][str(daemon)]
+            if old["existed"]:
+                atomic_bytes(daemon, (directory / "daemon.previous.json").read_bytes(), old["mode"])
+            elif daemon.exists():
+                daemon.unlink()
+            restored = commands.run(["systemctl", "restart", "docker.service"], check=False, timeout=120)
+            receipt["daemon_restored"] = restored.returncode == 0
+        receipt.update({"stage": "failed", "failed_at": stamp(), "error_type": type(error).__name__})
+        save_json(directory / "receipt.json", receipt)
+        print(json.dumps({"status": "FAILED", "receipt": str(directory / "receipt.json"),
+                          "daemon_restored": receipt.get("daemon_restored"),
+                          "packages_are_not_automatically_removed": True}), file=sys.stderr)
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-dir", default="/var/lib/servicehost-setup/docker")
+    args = parser.parse_args()
+    try:
+        install(args)
+    except (Refused, ValueError, OSError, subprocess.TimeoutExpired) as error:
+        print(f"REFUSED: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

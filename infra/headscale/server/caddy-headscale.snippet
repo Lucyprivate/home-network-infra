@@ -1,0 +1,10 @@
+# Insert inside the EXISTING HTTPS site, preserving all existing handlers/TLS.
+# This file is a site fragment, not a replacement Caddyfile.
+# No /api, /swagger, metrics, or gRPC is exposed by this matcher.
+@home_headscale path /health /version /key /ts2021 /register/* /auth/* /machine/ping-response /derp /derp/* /bootstrap-dns
+handle @home_headscale {
+    reverse_proxy 127.0.0.1:18080 {
+        header_up True-Client-IP {remote_host}
+        header_up X-Real-IP {remote_host}
+    }
+}

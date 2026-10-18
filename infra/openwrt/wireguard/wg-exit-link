@@ -1,0 +1,9 @@
+#!/bin/bash
+set -eu
+for i in {1..40}; do [ ! -S /run/wireguard/wg_exit.sock ] || break; sleep .1; done
+test -S /run/wireguard/wg_exit.sock
+/usr/local/bin/wg setconf wg_exit /etc/wireguard/wg_exit.conf
+ip address replace 10.200.0.1/30 dev wg_exit
+ip link set dev wg_exit mtu 1380 up
+# Required for strict reverse-path checks and downstream reply traffic.
+ip -4 route replace 10.10.20.0/24 dev wg_exit proto 186

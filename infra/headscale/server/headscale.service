@@ -1,0 +1,31 @@
+[Unit]
+Description=Headscale private home network control server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=headscale
+Group=headscale
+WorkingDirectory=/var/lib/headscale
+RuntimeDirectory=headscale
+RuntimeDirectoryMode=0750
+UMask=0077
+ExecStartPre=/usr/local/bin/headscale --config /etc/headscale/config.yaml configtest
+ExecStart=/usr/local/bin/headscale --config /etc/headscale/config.yaml serve
+Restart=on-failure
+RestartSec=10
+# CentOS 7 systemd 219 uses these names in the Service section.
+StartLimitInterval=120
+StartLimitBurst=3
+TimeoutStopSec=30
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWriteDirectories=/var/lib/headscale /run/headscale
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

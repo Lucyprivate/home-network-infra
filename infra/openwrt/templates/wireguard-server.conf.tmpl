@@ -1,0 +1,9 @@
+# wg setconf format. Address and routes are applied by the owned link helper.
+# EMPTY CREDENTIALS: insert privately, outside the repository.
+[Interface]
+PrivateKey =
+ListenPort = {{WG_PORT}}
+
+[Peer]
+PublicKey =
+AllowedIPs = {{WG_CLIENT_IP}}/32, {{LAN_CIDR}}

@@ -1,0 +1,17 @@
+/usr/sbin/homeproxy-guard
+/usr/libexec/homeproxy-guard-cleanup.uc
+/usr/libexec/homeproxy-guard-probe.uc
+/etc/init.d/homeproxy-guard
+/etc/homeproxy-guard/state
+/etc/homeproxy-guard/resume-node
+/etc/sysctl.d/99-homeproxy-buffer.conf
+/usr/sbin/openwrt-weekly-trim
+/usr/share/proxy-usage/model.uc
+/usr/share/proxy-usage/nft.uc
+/usr/share/proxy-usage/collector.uc
+/usr/libexec/proxy-usage-run
+/etc/init.d/proxy-usage
+/usr/share/rpcd/ucode/luci.proxy-usage
+/usr/share/rpcd/acl.d/luci-app-proxy-usage.json
+/usr/share/luci/menu.d/luci-app-proxy-usage.json
+/www/luci-static/resources/view/nlbw/proxy.js

@@ -1,0 +1,22 @@
+#!/bin/sh
+# A single weekly root filesystem discard; retains one private result.
+set -u
+umask 077
+BASE=/root/openwrt-maintenance
+[ ! -L "$BASE" ] || exit 1
+mkdir -p "$BASE" || exit 1
+chmod 700 "$BASE" || exit 1
+exec 9>/var/lock/openwrt-weekly-trim.lock
+flock -n 9 || exit 0
+output=$BASE/.trim.$$
+trap 'rm -f "$output"' EXIT HUP INT TERM
+{
+ date '+%Y-%m-%dT%H:%M:%S%z'
+ /usr/sbin/fstrim -v /
+} > "$output" 2>&1
+rc=$?
+printf 'exit_code=%s\n' "$rc" >> "$output"
+chmod 600 "$output"
+mv "$output" "$BASE/trim-last.log" || exit 1
+logger -t openwrt-fstrim "root filesystem trim exit_code=$rc; result=$BASE/trim-last.log"
+exit "$rc"

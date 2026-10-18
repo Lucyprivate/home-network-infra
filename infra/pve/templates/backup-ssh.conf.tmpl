@@ -1,0 +1,14 @@
+# Copy privately, set absolute key/known-host paths, verify host key out of band.
+# The backup account needs only the explicitly reviewed remote read capability.
+Host pve-uplink
+    HostName {{PVE_UPLINK_IP}}
+    User {{SSH_USER}}
+    Port {{SSH_PORT}}
+    IdentityFile /PRIVATE/PATH/backup_ed25519
+    UserKnownHostsFile /PRIVATE/PATH/known_hosts
+    StrictHostKeyChecking yes
+    IdentitiesOnly yes
+    BatchMode yes
+    ConnectTimeout 10
+    ServerAliveInterval 15
+    ServerAliveCountMax 2

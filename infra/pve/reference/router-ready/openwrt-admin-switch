@@ -1,0 +1,399 @@
+#!/bin/sh
+# OpenWrt ash. Only the named, IPv4 WAN INPUT rule below is added.
+# Persistent snapshots/state and a separate procd watchdog precede every change.
+set -u
+umask 077
+STORE=/root/codex-upstream-admin
+RUN=/var/run/codex-upstream-admin
+CONFIG=/etc/config/firewall
+INIT=/etc/init.d/codex-upstream-admin
+FIREWALL_INIT=/etc/init.d/firewall
+SELF=/usr/sbin/openwrt-admin-switch
+BOOT_FILE=/proc/sys/kernel/random/boot_id
+UPTIME_FILE=/proc/uptime
+PROC=/proc
+ROOT_UID=0
+TIMEOUT=300
+RULE=codex_upstream_admin
+NAME='Allow upstream HTTPS and SSH'
+STATE="$STORE/state"
+
+fail() { printf '%s\n' "$1" >&2; return 1; }
+uint() { case "$1" in ''|*[!0-9]*) return 1;; esac; }
+sha() {
+    digest=$(sha256sum "$1" 2>> "$STORE/events.log") || return 1
+    digest=${digest%% *}
+    [ "${#digest}" = 64 ] || return 1
+    case "$digest" in *[!a-f0-9]*) return 1;; esac
+    printf '%s\n' "$digest"
+}
+boot() { cat "$BOOT_FILE"; }
+now() { read -r value rest < "$UPTIME_FILE"; printf '%s\n' "${value%%.*}"; }
+log() { printf '%s %s\n' "$(now)" "$1" >> "$STORE/events.log"; }
+step() {
+    local step_name step_rc
+    step_name=$1; shift
+    "$@"; step_rc=$?
+    log "step=$step_name rc=$step_rc"
+    return "$step_rc"
+}
+private_dir() {
+    [ ! -L "$1" ] || return 1
+    mkdir -p "$1" || return 1
+    [ "$(ucode -e 'import { stat } from "fs"; let s=stat(ARGV[0]); if(!s) exit(1); print(s.uid+"\n");' "$1")" = "$ROOT_UID" ] || return 1
+    chmod 700 "$1"
+}
+setup() {
+    [ "$(id -u)" = "$ROOT_UID" ] || { fail 'Requires root.'; return 1; }
+    private_dir "$STORE" && private_dir "$RUN" || return 1
+    [ ! -L "$STATE" ] && [ ! -L "$RUN/lock" ] || return 1
+    exec 9> "$RUN/lock" || return 1
+    chmod 600 "$RUN/lock"
+}
+field() { awk -F= -v key="$1" '$1 == key {sub(/^[^=]*=/, ""); print; found++} END {if(found != 1) exit 1}' "$STATE"; }
+load_state() {
+    [ -f "$STATE" ] && [ ! -L "$STATE" ] || return 1
+    [ "$(field schema)" = 1 ] || return 1
+    phase=$(field phase) && tx=$(field transaction) && saved_boot=$(field boot_id) &&
+      deadline=$(field deadline_uptime) && origin=$(field initiating_session) &&
+      before_sha=$(field before_sha256) && candidate_sha=$(field candidate_sha256) &&
+      config_mode=$(field config_mode) || return 1
+    case "$phase" in arming|pending|rollback_pending|confirmed|rolled_back) ;; *) return 1;; esac
+    case "$tx" in ''|*[!a-zA-Z0-9_-]*) return 1;; esac
+    case "$saved_boot" in ''|*[!a-fA-F0-9-]*) return 1;; esac
+    uint "$deadline" || return 1
+    [ "${#before_sha}" = 64 ] && [ "${#candidate_sha}" = 64 ] || return 1
+    case "$before_sha$candidate_sha" in *[!a-f0-9]*) return 1;; esac
+    case "$config_mode" in ''|*[!0-7]*) return 1;; esac
+    backup="$STORE/transactions/$tx/firewall.before"
+    candidate="$STORE/transactions/$tx/candidate/firewall"
+    [ -f "$backup" ] && [ ! -L "$backup" ] && [ "$(sha "$backup")" = "$before_sha" ] || return 1
+    return 0
+}
+save_state() {
+    phase=$1
+    temp="$STORE/.state.$$"
+    {
+      printf 'schema=1\nphase=%s\ntransaction=%s\nboot_id=%s\ndeadline_uptime=%s\n' "$phase" "$tx" "$saved_boot" "$deadline"
+      printf 'initiating_session=%s\nbefore_sha256=%s\ncandidate_sha256=%s\nconfig_mode=%s\n' "$origin" "$before_sha" "$candidate_sha" "$config_mode"
+    } > "$temp" || return 1
+    chmod 600 "$temp" && mv -f "$temp" "$STATE" && sync
+}
+pending() { case "$phase" in arming|pending|rollback_pending) return 0;; *) return 1;; esac; }
+valid_address() {
+    address=$1
+    case "$address" in
+      *%*)
+        zone=${address#*%}
+        address=${address%%%*}
+        case "$address" in *:*) ;; *) return 1;; esac
+        case "$zone" in ''|*[!a-zA-Z0-9_.:-]*) return 1;; esac
+        ;;
+    esac
+    case "$address" in ''|*[!0-9a-fA-F:.]*) return 1;; esac
+}
+valid_session() {
+    value=$1
+    # SSH_CONNECTION is a four-token IP/port tuple, never evaluated as shell.
+    case "$value" in ''|*[!0-9a-zA-Z:._\ %-]*) return 1;; esac
+    set -- $value
+    [ "$#" = 4 ] && valid_address "$1" && valid_address "$3" && uint "$2" && uint "$4" || return 1
+    [ "$2" -ge 1 ] && [ "$2" -le 65535 ] && [ "$4" -ge 1 ] && [ "$4" -le 65535 ]
+}
+no_changes() {
+    changes=$(uci -q changes "$@" 2>> "$STORE/events.log") || return 1
+    [ -z "$changes" ]
+}
+stop_watch() {
+    limited 10 "$INIT" disable >> "$STORE/events.log" 2>&1 || return 1
+    limited 10 "$INIT" stop >> "$STORE/events.log" 2>&1
+}
+pid_ticks() { sed 's/^[^)]*) //' "$PROC/$1/stat" | awk '{print $20}'; }
+pid_group() { sed 's/^[^)]*) //' "$PROC/$1/stat" | awk '{print $3}'; }
+worker_running() {
+    [ -f "$RUN/worker" ] && [ ! -L "$RUN/worker" ] || return 1
+    read -r worker_pid worker_boot worker_ticks < "$RUN/worker" || return 1
+    uint "$worker_pid" && uint "$worker_ticks" || return 1
+    [ "$worker_boot" = "$(boot)" ] && kill -0 "$worker_pid" 2>/dev/null || return 1
+    [ "$(pid_ticks "$worker_pid" 2>/dev/null)" = "$worker_ticks" ] || return 1
+    cmd=$(tr '\000' ' ' < "$PROC/$worker_pid/cmdline") || return 1
+    case "$cmd" in *"$SELF watch"*) return 0;; *) return 1;; esac
+}
+start_watch() {
+    # Caller holds the short transaction lock. Worker writes readiness BEFORE
+    # attempting that lock, and never holds it while sleeping.
+    worker_running && return 0
+    rm -f "$RUN/worker"
+    limited 10 "$INIT" enable >> "$STORE/events.log" 2>&1 &&
+      limited 10 "$INIT" start >> "$STORE/events.log" 2>&1 || return 1
+    count=0
+    while [ "$count" -lt 8 ]; do
+      worker_running && return 0
+      sleep 1
+      count=$((count + 1))
+    done
+    return 1
+}
+limited() {
+    local limit child child_ticks supervisor command_rc sleeper
+    limit=$1; shift
+    # No timeout/stat applets are required on this OpenWrt image. Both the
+    # command and its supervisor close the transaction FD before executing.
+    (
+      exec 9>&-
+      # setsid creates a temporary group containing ONLY this bounded command.
+      # Its leader stays alive after TERM, anchoring PGID identity until KILL;
+      # command descendants therefore cannot outlive a timeout and reload later.
+      exec setsid /bin/sh -c '
+        group=$(sed "s/^[^)]*) //" "/proc/$$/stat" | awk "{print \$3}")
+        [ "$group" = "$$" ] || exit 125
+        trap "while :; do sleep 1; done" TERM
+        "$@" & command_pid=$!
+        wait "$command_pid"; rc=$?
+        exit "$rc"
+      ' codex-bounded "$@"
+    ) &
+    child=$!
+    child_ticks=$(pid_ticks "$child" 2>/dev/null) || child_ticks=''
+    (
+      exec 9>&-
+      sleeper=''
+      trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; exit 0' TERM INT
+      sleep "$limit" & sleeper=$!; wait "$sleeper"; sleeper=''
+      if [ -n "$child_ticks" ] && [ "$(pid_ticks "$child" 2>/dev/null)" = "$child_ticks" ] && [ "$(pid_group "$child" 2>/dev/null)" = "$child" ]; then
+        kill -TERM "-$child" 2>/dev/null || exit 0
+        sleep 5 & sleeper=$!; wait "$sleeper"; sleeper=''
+        if [ "$(pid_ticks "$child" 2>/dev/null)" = "$child_ticks" ] && [ "$(pid_group "$child" 2>/dev/null)" = "$child" ]; then
+          kill -KILL "-$child" 2>/dev/null
+        fi
+      fi
+    ) &
+    supervisor=$!
+    wait "$child"; command_rc=$?
+    kill -TERM "$supervisor" 2>/dev/null || true
+    wait "$supervisor" 2>/dev/null || true
+    return "$command_rc"
+}
+bounded() { limited 20 "$@" >> "$STORE/events.log" 2>&1; }
+install_config() {
+    temp="${CONFIG%/*}/.firewall.codex.$$"
+    [ ! -L "$temp" ] || return 1
+    cp "$1" "$temp" && chmod "$config_mode" "$temp" && mv -f "$temp" "$CONFIG" && sync
+}
+uci_expect() {
+    local rule_key expected got read_rc
+    rule_key=$1; expected=$2; shift 2
+    got=$(uci -q "$@" get "$rule_key" 2>> "$STORE/events.log"); read_rc=$?
+    if [ "$read_rc" = 0 ] && [ "$got" = "$expected" ]; then
+      log "uci_field=$rule_key get_rc=$read_rc match=yes"
+      return 0
+    fi
+    # Only this tool's eight public rule fields are logged, never full UCI.
+    log "uci_field=$rule_key get_rc=$read_rc match=no value=$got"
+    return 1
+}
+rule_values() {
+    local dest_rc
+    uci_expect "firewall.$RULE" rule "$@" &&
+      uci_expect "firewall.$RULE.name" "$NAME" "$@" &&
+      uci_expect "firewall.$RULE.src" wan "$@" &&
+      uci_expect "firewall.$RULE.src_ip" 10.10.10.0/24 "$@" &&
+      uci_expect "firewall.$RULE.family" ipv4 "$@" &&
+      uci_expect "firewall.$RULE.proto" tcp "$@" &&
+      uci_expect "firewall.$RULE.dest_port" '22 443' "$@" &&
+      uci_expect "firewall.$RULE.target" ACCEPT "$@" || return 1
+    uci -q "$@" get "firewall.$RULE.dest" > /dev/null 2>> "$STORE/events.log"; dest_rc=$?
+    log "uci_field=firewall.$RULE.dest get_rc=$dest_rc must_be_absent=yes"
+    [ "$dest_rc" != 0 ]
+}
+candidate_file_gate() {
+    local active_sha owned_section
+    active_sha=$(sha "$CONFIG") || return 1
+    owned_section=no
+    grep -Eq "^[[:space:]]*config[[:space:]]+rule[[:space:]]+['\"]?codex_upstream_admin(['\"]|[[:space:]]|$)" "$CONFIG" && owned_section=yes
+    # The text marker is diagnostic; hash and fresh UCI are authoritative.
+    log "active_sha=$active_sha candidate_sha=$candidate_sha owned_section_text=$owned_section"
+    [ "$active_sha" = "$candidate_sha" ]
+}
+runtime_rule() {
+    step runtime_read_input limited 10 nft -a list chain inet fw4 input > "$STORE/runtime-input" 2>> "$STORE/events.log" || return 1
+    step runtime_read_wan limited 10 nft -a list chain inet fw4 input_wan > "$STORE/runtime-wan" 2>> "$STORE/events.log" || return 1
+    # Verify the rule is reachable through INPUT, never FORWARD, and restricts
+    # source, family and both destination ports. Reject unfamiliar rendering.
+    grep -Eq 'type filter hook input ' "$STORE/runtime-input" &&
+      grep -Eq 'iifname "eth0" jump input_wan' "$STORE/runtime-input" || return 1
+    awk -v comment="!fw4: $NAME" '
+      index($0, "comment \"" comment "\"") {
+        n++; line=$0
+        sub(/^[ \t]+/, "", line)
+        sub(/^meta nfproto ipv4 /, "", line)
+        if (line !~ /^ip saddr 10\.10\.10\.0\/24 tcp dport \{ 22, 443 \} counter packets [0-9]+ bytes [0-9]+ accept comment /) bad=1
+        if (line !~ /" # handle [0-9]+[ \t]*$/) bad=1
+      }
+      END {exit !(n == 1 && !bad)}' "$STORE/runtime-wan"
+}
+runtime_absent() {
+    limited 10 nft -a list table inet fw4 > "$STORE/runtime-table" 2>> "$STORE/events.log" || return 1
+    ! grep -F "comment \"!fw4: $NAME\"" "$STORE/runtime-table" > /dev/null
+}
+restore_locked() {
+    save_state rollback_pending || return 1
+    # Do not silently overwrite unrelated concurrent firewall edits or deltas.
+    no_changes firewall || { log 'rollback_waiting_uncommitted_firewall'; return 1; }
+    current=$(sha "$CONFIG") || return 1
+    [ "$current" = "$before_sha" ] || [ "$current" = "$candidate_sha" ] || {
+      log 'rollback_waiting_foreign_firewall_change'; return 1;
+    }
+    step restore_install install_config "$backup" && step restore_check bounded fw4 check && step restore_reload bounded "$FIREWALL_INIT" reload &&
+      [ "$(sha "$CONFIG")" = "$before_sha" ] && runtime_absent || {
+        log 'rollback_failed_retry_pending'; return 1;
+      }
+    save_state rolled_back || return 1
+    log 'rollback_complete'
+    return 0
+}
+abort_stage() {
+    log "$1"
+    if restore_locked; then
+      flock -u 9
+      stop_watch || true
+    else
+      # Restoring failed: keep persistent state and watcher enabled/running.
+      start_watch || log 'watch_start_failed_manual_restore_required'
+    fi
+    fail 'Stage failed; see private transaction log. Rollback remains armed unless restoration succeeded.'
+}
+stage_locked() {
+    if [ -e "$STATE" ]; then
+      load_state || { fail 'Invalid persistent state; refusing.'; return 1; }
+      pending && { fail 'A transaction is already pending.'; return 1; }
+      [ "$phase" = rolled_back ] || { fail 'Existing confirmed transaction; use rollback before staging again.'; return 1; }
+    fi
+    origin=${SSH_CONNECTION:-}
+    valid_session "$origin" || { fail 'Stage requires an SSH_CONNECTION tuple.'; return 1; }
+    no_changes || { fail 'Uncommitted UCI changes; refusing.'; return 1; }
+    [ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || return 1
+    if uci -q get "firewall.$RULE" > /dev/null 2>&1; then fail 'Named UCI rule collision; refusing.'; return 1; fi
+    uci -q show firewall > "$STORE/firewall-show" 2>> "$STORE/events.log" || return 1
+    if grep -F ".name='$NAME'" "$STORE/firewall-show" > /dev/null; then fail 'Firewall rule name collision; refusing.'; return 1; fi
+    runtime_absent || { fail 'Runtime rule collision or firewall unavailable; refusing.'; return 1; }
+    bounded fw4 check || { fail 'Existing firewall is invalid; refusing.'; return 1; }
+    tx="$(now)-$$"
+    directory="$STORE/transactions/$tx"
+    mkdir -p "$STORE/transactions" && chmod 700 "$STORE/transactions" && mkdir "$directory" || return 1
+    chmod 700 "$directory"
+    backup="$directory/firewall.before"
+    cp "$CONFIG" "$backup" && chmod 600 "$backup" || return 1
+    before_sha=$(sha "$backup") || return 1
+    config_mode=$(ucode -e 'import { stat } from "fs"; let s=stat(ARGV[0]); if(!s) exit(1); print(sprintf("%o",s.mode & 0777)+"\n");' "$CONFIG") || return 1
+    private_dir "$directory/candidate" && private_dir "$directory/delta" &&
+      private_dir "$directory/override-empty" && private_dir "$directory/delta-empty" || return 1
+    candidate="$directory/candidate/firewall"
+    cp "$backup" "$candidate" || return 1
+    for item in "$RULE=rule" "$RULE.name=$NAME" "$RULE.src=wan" "$RULE.src_ip=10.10.10.0/24" "$RULE.family=ipv4" "$RULE.proto=tcp" "$RULE.dest_port=22 443" "$RULE.target=ACCEPT"; do
+      uci -q -c "$directory/candidate" -C "$directory/override-empty" -P "$directory/delta" set "firewall.$item" >> "$STORE/events.log" 2>&1 || return 1
+    done
+    # This UCI build can return success from private commit while retaining
+    # changes only in its private delta. Export the merged package explicitly.
+    uci -q -N -c "$directory/candidate" -C "$directory/override-empty" -P "$directory/delta" export firewall > "$directory/firewall.materialized" 2>> "$STORE/events.log" || return 1
+    chmod 600 "$directory/firewall.materialized" && mv -f "$directory/firewall.materialized" "$candidate" || return 1
+    candidate_sha=$(sha "$candidate") || return 1
+    [ "$candidate_sha" != "$before_sha" ] || { fail 'Candidate bytes unchanged; refusing before arming.'; return 1; }
+    # Deliberately use an EMPTY delta and override context here: proving values
+    # visible through the staging delta does not prove they exist on disk.
+    step candidate_materialized_values rule_values -c "$directory/candidate" -C "$directory/override-empty" -P "$directory/delta-empty" || {
+      fail 'Materialized candidate failed fresh UCI validation; refusing before arming.'; return 1;
+    }
+    saved_boot=$(boot)
+    deadline=$(( $(now) + TIMEOUT ))
+    [ "$(sha "$CONFIG")" = "$before_sha" ] && no_changes || { fail 'Firewall changed during preparation; refusing.'; return 1; }
+    save_state arming || return 1
+    start_watch || { abort_stage 'watch_not_ready_before_apply'; return 1; }
+    # There is now an independently running procd worker and persistent deadline.
+    [ "$(boot)" = "$saved_boot" ] && [ "$(now)" -lt "$deadline" ] &&
+      worker_running && [ "$(sha "$CONFIG")" = "$before_sha" ] && no_changes || {
+        abort_stage 'preapply_gate_failed'; return 1;
+      }
+    step stage_install install_config "$candidate" || { abort_stage 'stage_install_failed'; return 1; }
+    step stage_after_install_hash candidate_file_gate || { abort_stage 'stage_installed_hash_failed'; return 1; }
+    step stage_uci_before_reload rule_values || { abort_stage 'stage_uci_before_reload_failed'; return 1; }
+    step stage_check bounded fw4 check || { abort_stage 'stage_check_failed'; return 1; }
+    step stage_reload bounded "$FIREWALL_INIT" reload || { abort_stage 'stage_reload_failed'; return 1; }
+    step stage_after_reload_hash candidate_file_gate || { abort_stage 'stage_reloaded_hash_failed'; return 1; }
+    step stage_uci_values rule_values || { abort_stage 'stage_uci_values_failed'; return 1; }
+    step stage_runtime runtime_rule || { abort_stage 'stage_runtime_failed'; return 1; }
+    [ "$(now)" -lt "$deadline" ] && worker_running || { abort_stage 'deadline_or_worker_lost'; return 1; }
+    save_state pending || { abort_stage 'pending_state_write_failed'; return 1; }
+    log 'staged_pending_new_ssh_confirmation'
+    printf 'phase=pending\ntransaction=%s\ndeadline_uptime=%s\n' "$tx" "$deadline"
+}
+confirm_locked() {
+    load_state && [ "$phase" = pending ] || { fail 'No pending staged rule.'; return 1; }
+    session=${SSH_CONNECTION:-}
+    valid_session "$session" && [ "$session" != "$origin" ] || { fail 'Use a new SSH connection tuple.'; return 1; }
+    [ "$(boot)" = "$saved_boot" ] && [ "$(now)" -lt "$deadline" ] && worker_running || {
+      fail 'Deadline expired, boot changed or watcher unavailable; rollback remains armed.'; return 1;
+    }
+    no_changes && [ "$(sha "$CONFIG")" = "$candidate_sha" ] && step confirm_check bounded fw4 check &&
+      step confirm_uci_values rule_values && step confirm_runtime runtime_rule || { fail 'Configuration/runtime verification failed; rollback remains armed.'; return 1; }
+    [ "$(now)" -lt "$deadline" ] || return 1
+    save_state confirmed && log 'confirmed' || return 1
+    flock -u 9
+    stop_watch || { fail 'Confirmed, but watchdog service cleanup failed.'; return 1; }
+    printf 'phase=confirmed\n'
+}
+rollback_locked() {
+    load_state || { fail 'No valid transaction backup.'; return 1; }
+    [ "$phase" != rolled_back ] || { flock -u 9; stop_watch || true; printf 'phase=rolled_back\n'; return 0; }
+    save_state rollback_pending && start_watch || { fail 'Rollback watchdog unavailable; pending state retained.'; return 1; }
+    if restore_locked; then
+      flock -u 9
+      stop_watch || { fail 'Restored, but watchdog cleanup failed.'; return 1; }
+      printf 'phase=rolled_back\n'
+    else
+      fail 'Restoration failed; pending watchdog will retry.'
+    fi
+}
+watch() {
+    self_ticks=$(pid_ticks "$$") || return 1
+    printf '%s %s %s\n' "$$" "$(boot)" "$self_ticks" > "$RUN/.worker.$$" &&
+      mv -f "$RUN/.worker.$$" "$RUN/worker" || return 1
+    trap 'exit 0' TERM INT
+    while :; do
+      if flock -n -x 9; then
+        if ! load_state; then
+          log 'invalid_state_watch_retained'
+        elif pending; then
+          if [ "$phase" = rollback_pending ] || [ "$(boot)" != "$saved_boot" ] || [ "$(now)" -ge "$deadline" ]; then
+            if restore_locked; then
+              flock -u 9
+              stop_watch || return 1
+              return 0
+            fi
+          fi
+        else
+          flock -u 9
+          stop_watch || return 1
+          return 0
+        fi
+        flock -u 9
+      fi
+      sleep 2
+    done
+}
+setup || exit 1
+case "${1:-}" in
+  stage) [ "$#" = 1 ] && flock -x 9 && stage_locked;;
+  confirm) [ "$#" = 1 ] && flock -x 9 && confirm_locked;;
+  rollback) [ "$#" = 1 ] && flock -x 9 && rollback_locked;;
+  watch) [ "$#" = 1 ] && watch;;
+  _needs-watch) [ "$#" = 1 ] && load_state && pending;;
+  status)
+    [ "$#" = 1 ] && flock -x 9 || exit 1
+    if [ ! -e "$STATE" ]; then printf 'phase=initial\n';
+    elif load_state; then
+      printf 'phase=%s\ntransaction=%s\ndeadline_uptime=%s\nboot_changed=%s\n' "$phase" "$tx" "$deadline" "$([ "$(boot)" = "$saved_boot" ] && printf no || printf yes)"
+      if worker_running; then printf 'worker=running\n'; else printf 'worker=stopped\n'; fi
+    else fail 'Invalid persistent state.'; exit 1; fi;;
+  *) fail 'Usage: openwrt-admin-switch stage|confirm|rollback|status|watch'; exit 1;;
+esac

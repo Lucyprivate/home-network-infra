@@ -1,0 +1,11 @@
+[Unit]
+Description=Offline PDF firewall guard (public reference)
+Before=stirling-pdf.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 /srv/stirling-pdf/tools/network_guard.py --apply
+ExecStartPost=/usr/bin/python3 /srv/stirling-pdf/tools/network_guard.py --check
+# Stopping intentionally keeps the fail-closed firewall.
+[Install]
+WantedBy=multi-user.target

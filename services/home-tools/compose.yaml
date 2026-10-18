@@ -1,0 +1,269 @@
+{
+  "name": "home-tools",
+  "services": {
+    "portainer": {
+      "restart": "no",
+      "cpus": 0.5,
+      "pids_limit": 128,
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "labels": {
+        "io.codex.owner": "ServiceHostHomeTools20000101"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "3"
+        }
+      },
+      "stop_grace_period": "30s",
+      "image": "portainer/portainer-ce@sha256:03f94a406496dc84d37b552795fc424ccad8d0d7200353b6a82915f6e8f73ab0",
+      "container_name": "portainer",
+      "mem_limit": "256m",
+      "memswap_limit": "256m",
+      "ports": [
+        {
+          "target": 9443,
+          "published": "9443",
+          "host_ip": "0.0.0.0",
+          "protocol": "tcp"
+        }
+      ],
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/srv/home-tools/portainer/data",
+          "target": "/data",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "/var/run/docker.sock",
+          "target": "/var/run/docker.sock",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "/srv/home-tools/secrets/portainer-password.txt",
+          "target": "/run/secrets/portainer_admin",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "environment": {
+        "TZ": "Etc/UTC",
+        "GOMEMLIMIT": "192MiB"
+      },
+      "networks": {
+        "home_tools": {
+          "ipv4_address": "172.28.60.3"
+        }
+      },
+      "command": [
+        "--http-disabled",
+        "--admin-password-file",
+        "/run/secrets/portainer_admin",
+        "--host",
+        "unix:///var/run/docker.sock"
+      ]
+    },
+    "filebrowser": {
+      "restart": "no",
+      "cpus": 0.5,
+      "pids_limit": 128,
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "labels": {
+        "io.codex.owner": "ServiceHostHomeTools20000101"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "3"
+        }
+      },
+      "stop_grace_period": "30s",
+      "image": "gtstef/filebrowser@sha256:2e3936caf7b12908f7d3ebb68ddfcea075cda5f732e4bd95beae6cfa529cbec7",
+      "container_name": "filebrowser",
+      "mem_limit": "256m",
+      "memswap_limit": "256m",
+      "ports": [
+        {
+          "target": 80,
+          "published": "8081",
+          "host_ip": "0.0.0.0",
+          "protocol": "tcp"
+        }
+      ],
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/srv/files",
+          "target": "/srv",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "/srv/home-tools/filebrowser/data",
+          "target": "/home/filebrowser/data",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "/srv/home-tools/filebrowser/config/config.yaml",
+          "target": "/config/config.yaml",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "/srv/home-tools/filebrowser/tmp",
+          "target": "/tmp",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "environment": {
+        "TZ": "Etc/UTC",
+        "GOMEMLIMIT": "192MiB",
+        "FILEBROWSER_CONFIG": "/config/config.yaml"
+      },
+      "networks": {
+        "home_tools": {
+          "ipv4_address": "172.28.60.4"
+        }
+      },
+      "user": "1000:1000",
+      "read_only": true
+    },
+    "homepage": {
+      "restart": "no",
+      "cpus": 0.5,
+      "pids_limit": 128,
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "labels": {
+        "io.codex.owner": "ServiceHostHomeTools20000101"
+      },
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "5m",
+          "max-file": "3"
+        }
+      },
+      "stop_grace_period": "30s",
+      "image": "ghcr.io/gethomepage/homepage@sha256:57c4a0531937889c0b968b120fe9c2560bbe036b5c9e18c49a9e2479de9975d1",
+      "container_name": "homepage",
+      "mem_limit": "256m",
+      "memswap_limit": "256m",
+      "ports": [
+        {
+          "target": 3000,
+          "published": "3000",
+          "host_ip": "0.0.0.0",
+          "protocol": "tcp"
+        }
+      ],
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/srv/home-tools/homepage/config",
+          "target": "/app/config",
+          "read_only": false,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "/srv/home-tools/homepage/public",
+          "target": "/app/public/icons",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "environment": {
+        "TZ": "Etc/UTC",
+        "HOMEPAGE_ALLOWED_HOSTS": "10.10.10.42:3000,10.10.20.112:3000,100.100.10.2:3000,127.0.0.1:3000,localhost:3000",
+        "HOSTNAME": "0.0.0.0",
+        "PORT": "3000",
+        "NEXT_TELEMETRY_DISABLED": "1",
+        "LOG_TARGETS": "stdout",
+        "NODE_OPTIONS": "--max-old-space-size=160"
+      },
+      "networks": {
+        "home_tools": {
+          "ipv4_address": "172.28.60.5"
+        }
+      },
+      "user": "1000:1000",
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://127.0.0.1:3000/api/healthcheck"
+        ],
+        "interval": "30s",
+        "timeout": "5s",
+        "retries": 4,
+        "start_period": "40s"
+      }
+    }
+  },
+  "networks": {
+    "home_tools": {
+      "name": "home_tools",
+      "driver": "bridge",
+      "enable_ipv6": false,
+      "driver_opts": {
+        "com.docker.network.bridge.name": "br-home-tools"
+      },
+      "ipam": {
+        "config": [
+          {
+            "subnet": "172.28.60.0/28",
+            "gateway": "172.28.60.1"
+          }
+        ]
+      }
+    }
+  }
+}

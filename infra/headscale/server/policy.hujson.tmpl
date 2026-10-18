@@ -1,0 +1,218 @@
+{
+  "grants": [
+    {
+      "dst": [
+        "{{APP_TAIL_IP}}/32",
+        "{{UPLINK_CIDR}}",
+        "{{LAN_CIDR}}"
+      ],
+      "ip": [
+        "*"
+      ],
+      "src": [
+        "{{LINUX_TAIL_IP}}/32",
+        "{{TABLET_TAIL_IP}}/32",
+        "{{WINDOWS_TAIL_IP}}/32"
+      ]
+    },
+    {
+      "dst": [
+        "{{LINUX_TAIL_IP}}/32"
+      ],
+      "ip": [
+        "icmp:*"
+      ],
+      "src": [
+        "{{TABLET_TAIL_IP}}/32"
+      ]
+    },
+    {
+      "dst": [
+        "autogroup:internet"
+      ],
+      "ip": [
+        "*"
+      ],
+      "src": [
+        "{{LINUX_TAIL_IP}}/32",
+        "{{TABLET_TAIL_IP}}/32",
+        "{{WINDOWS_TAIL_IP}}/32"
+      ]
+    },
+    {
+      "dst": [
+        "{{WINDOWS_TAIL_IP}}/32"
+      ],
+      "ip": [
+        "icmp:*"
+      ],
+      "src": [
+        "{{TABLET_TAIL_IP}}/32"
+      ]
+    },
+    {
+      "dst": [
+        "{{WINDOWS_TAIL_IP}}/32"
+      ],
+      "ip": [
+        "tcp:3389",
+        "udp:3389"
+      ],
+      "src": [
+        "{{TABLET_TAIL_IP}}/32"
+      ]
+    }
+  ],
+  "tests": [
+    {
+      "accept": [
+        "{{APP_TAIL_IP}}:22",
+        "{{PVE_UPLINK_IP}}:8006",
+        "{{LAN_GATEWAY}}:80",
+        "{{APP_UPLINK_IP}}:8080",
+        "1.1.1.1:443"
+      ],
+      "deny": [
+        "10.10.99.254:22",
+        "100.100.10.250:22"
+      ],
+      "proto": "tcp",
+      "src": "{{LINUX_TAIL_IP}}"
+    },
+    {
+      "deny": [
+        "{{PVE_UPLINK_IP}}:8006",
+        "{{LAN_GATEWAY}}:80",
+        "1.1.1.1:443",
+        "{{LINUX_TAIL_IP}}:445"
+      ],
+      "src": "{{APP_TAIL_IP}}"
+    },
+    {
+      "accept": [
+        "{{APP_TAIL_IP}}:22",
+        "{{APP_TAIL_IP}}:8080",
+        "{{APP_TAIL_IP}}:8096",
+        "{{APP_TAIL_IP}}:3000",
+        "{{APP_TAIL_IP}}:8081",
+        "{{APP_TAIL_IP}}:9443",
+        "{{PVE_UPLINK_IP}}:8006",
+        "{{LAN_GATEWAY}}:80",
+        "1.1.1.1:443"
+      ],
+      "deny": [
+        "{{LINUX_TAIL_IP}}:22",
+        "10.10.99.254:22",
+        "100.100.10.250:22"
+      ],
+      "proto": "tcp",
+      "src": "{{TABLET_TAIL_IP}}"
+    },
+    {
+      "accept": [
+        "{{APP_TAIL_IP}}:22",
+        "{{APP_TAIL_IP}}:8080",
+        "{{APP_TAIL_IP}}:8096",
+        "{{APP_TAIL_IP}}:3000",
+        "{{APP_TAIL_IP}}:8081",
+        "{{APP_TAIL_IP}}:9443",
+        "{{PVE_UPLINK_IP}}:8006",
+        "{{LAN_GATEWAY}}:80",
+        "1.1.1.1:443"
+      ],
+      "deny": [
+        "{{LINUX_TAIL_IP}}:22",
+        "{{LINUX_TAIL_IP}}:445",
+        "{{LINUX_TAIL_IP}}:3389",
+        "{{TABLET_TAIL_IP}}:22",
+        "{{EXIT_TAIL_IP}}:22",
+        "10.10.99.254:22",
+        "100.100.10.250:22"
+      ],
+      "proto": "tcp",
+      "src": "{{WINDOWS_TAIL_IP}}"
+    },
+    {
+      "deny": [
+        "{{WINDOWS_TAIL_IP}}:22",
+        "{{WINDOWS_TAIL_IP}}:445",
+        "{{WINDOWS_TAIL_IP}}:3389"
+      ],
+      "proto": "tcp",
+      "src": "{{LINUX_TAIL_IP}}"
+    },
+    {
+      "accept": [
+        "{{WINDOWS_TAIL_IP}}:3389"
+      ],
+      "deny": [
+        "{{WINDOWS_TAIL_IP}}:22",
+        "{{WINDOWS_TAIL_IP}}:445"
+      ],
+      "proto": "tcp",
+      "src": "{{TABLET_TAIL_IP}}"
+    },
+    {
+      "deny": [
+        "{{WINDOWS_TAIL_IP}}:53",
+        "{{WINDOWS_TAIL_IP}}:137",
+        "{{WINDOWS_TAIL_IP}}:138",
+        "{{WINDOWS_TAIL_IP}}:5353"
+      ],
+      "proto": "udp",
+      "src": "{{TABLET_TAIL_IP}}"
+    },
+    {
+      "deny": [
+        "{{TABLET_TAIL_IP}}:53",
+        "{{TABLET_TAIL_IP}}:137",
+        "{{TABLET_TAIL_IP}}:138",
+        "{{TABLET_TAIL_IP}}:5353"
+      ],
+      "proto": "udp",
+      "src": "{{WINDOWS_TAIL_IP}}"
+    },
+    {
+      "accept": [
+        "{{WINDOWS_TAIL_IP}}:3389"
+      ],
+      "proto": "udp",
+      "src": "{{TABLET_TAIL_IP}}"
+    },
+    {
+      "deny": [
+        "{{WINDOWS_TAIL_IP}}:3389"
+      ],
+      "proto": "udp",
+      "src": "{{LINUX_TAIL_IP}}"
+    },
+    {
+      "deny": [
+        "{{WINDOWS_TAIL_IP}}:3389"
+      ],
+      "proto": "tcp",
+      "src": "{{APP_TAIL_IP}}"
+    },
+    {
+      "deny": [
+        "{{WINDOWS_TAIL_IP}}:3389"
+      ],
+      "proto": "udp",
+      "src": "{{APP_TAIL_IP}}"
+    },
+    {
+      "deny": [
+        "{{WINDOWS_TAIL_IP}}:3389"
+      ],
+      "proto": "tcp",
+      "src": "{{EXIT_TAIL_IP}}"
+    },
+    {
+      "deny": [
+        "{{WINDOWS_TAIL_IP}}:3389"
+      ],
+      "proto": "udp",
+      "src": "{{EXIT_TAIL_IP}}"
+    }
+  ]
+}

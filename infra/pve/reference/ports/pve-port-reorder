@@ -1,0 +1,439 @@
+#!/usr/bin/python3
+"""Guarded offline ETH2 management / ETH3 rescue handoff. No guest changes."""
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import re
+import socket
+import stat
+import struct
+import subprocess
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path('/var/lib/codex-pve-port-reorder')
+UNITS = Path('/etc/systemd/system')
+NET = Path('/etc/network/interfaces')
+PENDING = Path('/etc/network/interfaces.new')
+RA = Path('/etc/sysctl.d/90-codex-pve-bridge-ra.conf')
+DNS = Path('/etc/resolv.conf')
+HOSTS = Path('/etc/hosts')
+SYSNET = Path('/sys/class/net')
+SYSCTL = Path('/proc/sys/net/ipv6/conf')
+IP = '10.10.99.10'
+CLIENT_IP = '10.10.99.55'
+CLIENT_MAC = '02:00:00:00:20:01'
+MACS = {'enp2s0': '02:00:00:00:10:00', 'enp3s0': '02:00:00:00:10:01',
+        'enp4s0': '02:00:00:00:10:02', 'enp5s0': '02:00:00:00:10:03'}
+TIMEOUT = 300
+LAYOUT = 'wan0-lan1-management2-rescue3-v1'
+FILES = (NET, PENDING, RA, DNS, HOSTS)
+PROTECTED = ('/etc/pve/qemu-server/100.conf', '/etc/pve/qemu-server/150.conf',
+             '/etc/modprobe.d/vfio.conf', '/etc/modprobe.d/blacklist-mt7915e.conf',
+             '/etc/default/grub')
+
+class Refusal(Exception):
+    pass
+
+def run(argv, check=True, timeout=70):
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    if check and result.returncode:
+        raise Refusal('Failed: ' + ' '.join(argv) + ': ' + result.stderr[:500])
+    return result
+
+def write(path, data, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.new-' + uuid.uuid4().hex[:8])
+    with open(tmp, 'xb') as stream:
+        os.chmod(tmp, mode)
+        stream.write(data.encode() if isinstance(data, str) else data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, path)
+
+def state():
+    path = ROOT / 'state.json'
+    return json.loads(path.read_text()) if path.exists() else {'phase': 'initial', 'layout': LAYOUT}
+
+def save(value):
+    write(ROOT / 'state.json', json.dumps(value, indent=2) + '\n')
+
+def addresses():
+    return json.loads(run(['ip', '-j', '-4', 'addr', 'show']).stdout)
+
+def defaults():
+    return json.loads(run(['ip', '-j', '-4', 'route', 'show', 'default']).stdout)
+
+def owners(address=IP):
+    return [row['ifname'] for row in addresses() for item in row.get('addr_info', [])
+            if item.get('local') == address]
+
+def ports(bridge):
+    path = SYSNET / bridge / 'brif'
+    return sorted(item.name for item in path.iterdir()) if path.exists() else []
+
+def carrier(dev):
+    try:
+        return (SYSNET / dev / 'carrier').read_text().strip() == '1'
+    except OSError:
+        return False
+
+def session(fresh=None):
+    value = os.environ.get('SSH_CONNECTION', '')
+    fields = value.split()
+    if len(fields) != 4 or fields[0] != CLIENT_IP or fields[2] != IP:
+        raise Refusal('Use the Ubuntu direct connection 10.10.99.55 -> 10.10.99.10.')
+    if fresh and value == fresh:
+        raise Refusal('Confirmation requires a fresh TCP SSH connection.')
+    return value
+
+def protected():
+    names = set(PROTECTED) | {str(path) for path in Path('/etc/modprobe.d').glob('*.conf')}
+    return {name: hashlib.sha256(Path(name).read_bytes()).hexdigest()
+            for name in sorted(names) if Path(name).is_file()}
+
+def unchanged(snapshot):
+    if protected() != snapshot['protected']:
+        raise Refusal('Protected VM/VFIO/boot files changed; leave rollback armed.')
+
+def immutable_prefix(text):
+    marker = re.search(r'^# ETH2 -[^\n]*\n', text, re.M)
+    if not marker:
+        raise Refusal('Missing expected ETH2 section; inspect configuration manually.')
+    return text[:marker.start()]
+
+def expand_candidate(text):
+    if re.search(r'^iface vmbr3 ', text, re.M):
+        raise Refusal('vmbr3 already configured.')
+    memberships = [line.split() for line in re.findall(r'^[ \t]+bridge-ports[ \t]+([^\n]+)$', text, re.M)]
+    selected = [members for members in memberships if 'enp4s0' in members or 'enp5s0' in members]
+    if selected != [['enp4s0']]:
+        raise Refusal('Unexpected initial bridge membership.')
+    if text.count('address 10.10.99.10/24') != 1 or text.count('gateway 10.10.99.2') != 1:
+        raise Refusal('Unexpected initial rescue address/default.')
+    return re.sub(r'(^[ \t]+bridge-ports[ \t]+)enp4s0([ \t]*$)',
+                  r'\1enp4s0 enp5s0\2', text, count=1, flags=re.M)
+
+def final_candidate(text):
+    memberships = [line.split() for line in re.findall(r'^[ \t]+bridge-ports[ \t]+([^\n]+)$', text, re.M)]
+    selected = [members for members in memberships if 'enp4s0' in members or 'enp5s0' in members]
+    if selected != [['enp4s0', 'enp5s0']]:
+        raise Refusal('Expected confirmed dual-port rescue baseline.')
+    footer = re.search(r'^source /etc/network/interfaces\.d/\*[^\n]*\n?$', text, re.M)
+    if not footer or text[footer.end():].strip():
+        raise Refusal('Unexpected network footer; inspect configuration manually.')
+    return immutable_prefix(text) + '''# ETH2 - PVE daily management (10.10.10.10 reserved; not active)
+iface enp4s0 inet manual
+
+auto vmbr2
+iface vmbr2 inet manual
+        bridge-ports enp4s0
+        bridge-stp off
+        bridge-fd 0
+        hwaddress ether 02:00:00:00:10:02
+
+# ETH3 - PVE direct rescue
+iface enp5s0 inet manual
+
+auto vmbr3
+iface vmbr3 inet static
+        address 10.10.99.10/24
+        bridge-ports enp5s0
+        bridge-stp off
+        bridge-fd 0
+        hwaddress ether 02:00:00:00:10:03
+
+''' + text[footer.start():]
+
+def ra_content():
+    names = ('vmbr0', 'vmbr1', 'vmbr2', 'vmbr3', 'enp4s0', 'enp5s0')
+    return '# Keep IPv6 link-local; reject router-advertised host defaults.\n' + ''.join(
+        f'net.ipv6.conf.{name}.{key}=0\n' for name in names for key in ('accept_ra', 'accept_ra_defrtr'))
+
+def apply_ra():
+    for dev in ('vmbr0', 'vmbr1', 'vmbr2', 'vmbr3', 'enp4s0', 'enp5s0'):
+        for key in ('accept_ra', 'accept_ra_defrtr'):
+            path = SYSCTL / dev / key
+            if path.exists():
+                path.write_text('0\n')
+
+def capture_file(path):
+    if path.is_symlink():
+        raise Refusal('A managed file is a symlink: ' + str(path))
+    if not path.exists():
+        return {'kind': 'missing'}
+    return {'kind': 'file', 'data': base64.b64encode(path.read_bytes()).decode(),
+            'mode': stat.S_IMODE(path.stat().st_mode)}
+
+def files_match(snap):
+    return all(capture_file(Path(name)) == record for name, record in snap['files'].items())
+
+def address_set(rows):
+    return sorted((row['ifname'], item.get('local'), item.get('prefixlen'))
+                  for row in rows for item in row.get('addr_info', []) if item.get('family', 'inet') == 'inet')
+
+def route_set(rows):
+    return sorted((row.get('dev', ''), row.get('gateway', ''), row.get('metric', 0)) for row in rows)
+
+def snapshot(previous, transaction):
+    directory = ROOT / 'snapshots' / transaction
+    directory.mkdir(parents=True, mode=0o700)
+    sysctls = {str(path): path.read_text() for dev in ('vmbr0', 'vmbr1', 'vmbr2', 'vmbr3', 'enp4s0', 'enp5s0')
+               for key in ('accept_ra', 'accept_ra_defrtr') if (path := SYSCTL / dev / key).exists()}
+    value = {'files': {str(path): capture_file(path) for path in FILES},
+             'previous': previous, 'protected': protected(), 'sysctls': sysctls,
+             'links_up': {dev: bool(int((SYSNET / dev / 'flags').read_text(), 16) & 1) for dev in MACS},
+             'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+             'ipv4_before': addresses(), 'routes_before': defaults(),
+             'guest_bridge_ports': {br: ports(br) for br in ('vmbr0', 'vmbr1')},
+             'created_utc': datetime.now(timezone.utc).isoformat()}
+    write(directory / 'snapshot.json', json.dumps(value, indent=2) + '\n')
+    return directory, value
+
+def manifest(transaction):
+    if not re.fullmatch(r'(expand|final)-[a-f0-9]{12}', transaction):
+        raise Refusal('Invalid transaction identifier.')
+    return json.loads((ROOT / 'snapshots' / transaction / 'snapshot.json').read_text())
+
+def unit(transaction):
+    return 'codex-pve-port-' + transaction
+
+def cleanup(transaction):
+    name = unit(transaction)
+    run(['systemctl', 'disable', '--now', name + '.timer'], check=False)
+    for suffix in ('.timer', '.service'):
+        (UNITS / (name + suffix)).unlink(missing_ok=True)
+    Path('/var/lib/systemd/timers', 'stamp-' + name + '.timer').unlink(missing_ok=True)
+    run(['systemctl', 'daemon-reload'], check=False)
+
+def arm(transaction):
+    name = unit(transaction)
+    exe = str(Path(__file__).resolve())
+    if any(char.isspace() for char in exe):
+        raise Refusal('Install script at a path without whitespace.')
+    deadline = datetime.fromtimestamp(time.time() + TIMEOUT, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    write(UNITS / (name + '.service'), '[Unit]\nDescription=Restore unconfirmed PVE port handoff\nStartLimitIntervalSec=0\n[Service]\nType=oneshot\nExecStart=' + exe + ' rollback --transaction ' + transaction + '\nTimeoutStartSec=180\nRestart=on-failure\nRestartSec=15s\n', 0o644)
+    write(UNITS / (name + '.timer'), '[Unit]\nDescription=PVE port handoff 300 second deadline\n[Timer]\nOnActiveSec=300s\nOnCalendar=' + deadline + '\nPersistent=true\nAccuracySec=1s\n[Install]\nWantedBy=timers.target\n', 0o644)
+    run(['systemctl', 'daemon-reload'])
+    run(['systemctl', 'enable', '--now', name + '.timer'])
+    run(['systemctl', 'is-active', name + '.timer'])
+
+def announce(bridge):
+    own = bytes.fromhex((SYSNET / bridge / 'address').read_text().strip().replace(':', ''))
+    address = socket.inet_aton(IP)
+    packet = b'\xff' * 6 + own + struct.pack('!H', 0x0806)
+    packet += struct.pack('!HHBBH', 1, 0x0800, 6, 4, 1) + own + address + b'\x00' * 6 + address
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806)) as raw:
+        raw.bind((bridge, 0))
+        for _ in range(3):
+            raw.send(packet)
+            time.sleep(0.2)
+
+def wire_check():
+    session()
+    if carrier('enp4s0') or not carrier('enp5s0') or ports('vmbr2') != ['enp4s0', 'enp5s0']:
+        raise Refusal('Move only the PC cable to ETH3 before final migration.')
+    fdb = json.loads(run(['bridge', '-j', 'fdb', 'show', 'br', 'vmbr2']).stdout)
+    if not any(row.get('mac', '').lower() == CLIENT_MAC and row.get('ifname') == 'enp5s0'
+               and row.get('state') not in ('permanent', 'static') for row in fdb):
+        raise Refusal('PC MAC was not learned through ETH3; use a fresh SSH and verify wiring.')
+    return {'eth2_carrier': False, 'eth3_carrier': True, 'pc_mac': CLIENT_MAC, 'pc_port': 'enp5s0'}
+
+def verify(phase, snap):
+    unchanged(snap)
+    if any(ports(br) != expected for br, expected in snap['guest_bridge_ports'].items()):
+        raise Refusal('Guest bridge members changed.')
+    expected_bridge = 'vmbr3' if phase == 'final' else 'vmbr2'
+    if owners() != [expected_bridge] or owners('10.10.10.10'):
+        raise Refusal('Rescue address owner or inactive management address differs.')
+    expected_addresses = [(expected_bridge if address == IP else dev, address, prefix)
+                          for dev, address, prefix in address_set(snap['ipv4_before'])]
+    if address_set(addresses()) != sorted(expected_addresses):
+        raise Refusal('Runtime IPv4 addresses differ, including unchanged guest bridges.')
+    expected_ports = ['enp5s0'] if phase == 'final' else ['enp4s0', 'enp5s0']
+    if ports(expected_bridge) != expected_ports:
+        raise Refusal('Rescue bridge port membership differs.')
+    if immutable_prefix(NET.read_text()) != immutable_prefix(base64.b64decode(snap['files'][str(NET)]['data']).decode()):
+        raise Refusal('WAN/LAN configuration changed.')
+    if phase == 'final':
+        if ports('vmbr2') != ['enp4s0'] or defaults():
+            raise Refusal('Management bridge membership/default route differs.')
+        if re.search(r'^\s*nameserver\s', DNS.read_text(), re.M):
+            raise Refusal('Offline resolver must have no nameserver.')
+        if (SYSNET / 'vmbr3' / 'address').read_text().strip() != MACS['enp5s0']:
+            raise Refusal('Rescue bridge MAC differs.')
+    else:
+        routes = defaults()
+        if len(routes) != 1 or routes[0].get('gateway') != '10.10.99.2' or routes[0].get('dev') != 'vmbr2':
+            raise Refusal('Initial default route changed unexpectedly.')
+
+def begin(phase):
+    prior = state()
+    if prior.get('layout') != LAYOUT or prior['phase'] != ('initial' if phase == 'expand' else 'expand-confirmed'):
+        raise Refusal('Unexpected transaction state.')
+    connection = session()
+    if PENDING.exists():
+        raise Refusal('Resolve pending PVE GUI network configuration before migration.')
+    for dev, mac in MACS.items():
+        if (SYSNET / dev / 'address').read_text().strip().lower() != mac:
+            raise Refusal('Physical MAC differs: ' + dev)
+    if phase == 'expand':
+        if not carrier('enp4s0') or carrier('enp5s0') or ports('vmbr2') != ['enp4s0'] or owners() != ['vmbr2']:
+            raise Refusal('Expected ETH2-only rescue and unused ETH3.')
+        if any(row['ifname'] == 'enp5s0' and row.get('addr_info') for row in addresses()):
+            raise Refusal('Unused ETH3 already has IPv4.')
+        candidate = expand_candidate(NET.read_text())
+    else:
+        wire_check()
+        candidate = final_candidate(NET.read_text())
+    transaction = phase + '-' + uuid.uuid4().hex[:12]
+    directory, snap = snapshot(prior, transaction)
+    write(directory / 'interfaces.candidate', candidate)
+    listed = run(['ifquery', '-i', str(directory / 'interfaces.candidate'), '--list']).stdout.split()
+    # ifquery --list lists auto interfaces, not unaddressed manual physical ports.
+    required = ['lo', 'vmbr0', 'vmbr1', 'vmbr2'] + (['vmbr3'] if phase == 'final' else [])
+    if len(listed) != len(set(listed)) or not set(required).issubset(listed):
+        raise Refusal('Candidate interface validation failed.')
+    for dev in MACS:
+        if len(re.findall(r'^iface ' + re.escape(dev) + r' inet manual\s*$', candidate, re.M)) != 1:
+            raise Refusal('Candidate physical port declaration differs: ' + dev)
+    pending = {'layout': LAYOUT, 'phase': phase + '-pending', 'transaction': transaction,
+               'initiating_session': connection, 'deadline_unix': int(time.time()) + TIMEOUT}
+    save(pending)
+    try:
+        arm(transaction)
+    except Exception:
+        save(prior)
+        cleanup(transaction)
+        raise
+    run(['systemd-run', '--unit=' + unit(transaction) + '-apply', '--collect',
+         str(Path(__file__).resolve()), 'apply', '--transaction', transaction])
+    print(json.dumps(pending))
+
+def apply(transaction):
+    current = state()
+    if current.get('transaction') != transaction or not current['phase'].endswith('-pending'):
+        raise Refusal('Apply is no longer pending.')
+    phase = transaction.split('-')[0]
+    snap = manifest(transaction)
+    unchanged(snap)
+    if not files_match(snap):
+        raise Refusal('Managed files changed after staging; rollback remains armed.')
+    write(NET, (ROOT / 'snapshots' / transaction / 'interfaces.candidate').read_bytes(), snap['files'][str(NET)]['mode'])
+    write(RA, ra_content(), 0o644)
+    apply_ra()
+    if phase == 'final':
+        if owners() == ['vmbr2']:
+            run(['ip', '-4', 'addr', 'del', IP + '/24', 'dev', 'vmbr2'])
+        content = '\n'.join(line for line in DNS.read_text().splitlines() if not re.match(r'^\s*nameserver\s', line)) + '\n'
+        write(DNS, content, snap['files'][str(DNS)]['mode'])
+    run(['ifreload', '-a'])
+    if phase == 'final':
+        for route in defaults():
+            if route.get('gateway') == '10.10.99.2' and route.get('dev') == 'vmbr2':
+                run(['ip', '-4', 'route', 'del', 'default', 'via', '10.10.99.2', 'dev', 'vmbr2'])
+    apply_ra()
+    announce('vmbr3' if phase == 'final' else 'vmbr2')
+    verify(phase, snap)
+    current['applied'] = True
+    current['applied_utc'] = datetime.now(timezone.utc).isoformat()
+    save(current)
+
+def confirm():
+    current = state()
+    if not current['phase'].endswith('-pending') or not current.get('applied'):
+        raise Refusal('No successfully applied phase is pending.')
+    session(current['initiating_session'])
+    if time.time() >= current['deadline_unix']:
+        raise Refusal('Confirmation deadline passed; let rollback complete.')
+    phase = current['phase'].split('-')[0]
+    if not carrier('enp4s0' if phase == 'expand' else 'enp5s0'):
+        raise Refusal('Expected rescue cable carrier is missing.')
+    verify(phase, manifest(current['transaction']))
+    current['phase'] = phase + '-confirmed'
+    current['confirmed_utc'] = datetime.now(timezone.utc).isoformat()
+    save(current)
+    cleanup(current['transaction'])
+    print(json.dumps(current))
+
+def rollback(transaction=None):
+    current = state()
+    chosen = transaction or current.get('transaction')
+    if not chosen:
+        raise Refusal('No snapshot available.')
+    if transaction and (current.get('transaction') != transaction or not current['phase'].endswith('-pending')):
+        cleanup(transaction)
+        print('No pending transaction; no network change.')
+        return
+    snap = manifest(chosen)
+    if not transaction and snap['previous']['phase'] == 'initial' and not carrier('enp4s0'):
+        raise Refusal('Original rollback requires the PC cable on ETH2; current ETH3 rescue is kept.')
+    # Remove the new address first, preventing duplicate owners during restore.
+    if 'vmbr3' in owners():
+        run(['ip', '-4', 'addr', 'del', IP + '/24', 'dev', 'vmbr3'])
+    for name, record in snap['files'].items():
+        path = Path(name)
+        if record['kind'] == 'missing':
+            path.unlink(missing_ok=True)
+        else:
+            write(path, base64.b64decode(record['data']), record['mode'])
+    run(['ifreload', '-a'])
+    for name, value in snap['sysctls'].items():
+        path = Path(name)
+        if path.exists():
+            path.write_text(value)
+    for dev, was_up in snap['links_up'].items():
+        if not was_up:
+            run(['ip', 'link', 'set', 'dev', dev, 'down'])
+    if owners() != ['vmbr2']:
+        raise Refusal('Rollback rescue address is not restored; service will retry.')
+    expected = ['enp4s0'] if snap['previous']['phase'] == 'initial' else ['enp4s0', 'enp5s0']
+    if ports('vmbr2') != expected:
+        raise Refusal('Rollback port membership differs; service will retry.')
+    unchanged(snap)
+    if not files_match(snap) or route_set(defaults()) != route_set(snap['routes_before']):
+        raise Refusal('Rollback files/defaults differ; service will retry.')
+    if address_set(addresses()) != address_set(snap['ipv4_before']):
+        raise Refusal('Rollback IPv4 addresses differ; service will retry.')
+    if any(ports(br) != expected for br, expected in snap['guest_bridge_ports'].items()):
+        raise Refusal('Rollback guest bridge members differ; service will retry.')
+    announce('vmbr2')
+    save(snap['previous'])
+    cleanup(chosen)
+    print(json.dumps({'restored_transaction': chosen, 'state': snap['previous']}))
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', choices=['begin-expand', 'begin-final', 'apply', 'confirm', 'wire-check', 'rollback', 'status'])
+    parser.add_argument('--transaction')
+    args = parser.parse_args()
+    ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(ROOT, 0o700)
+    with open(ROOT / 'lock', 'a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if args.command == 'status':
+            print(json.dumps({'state': state(), 'addresses': addresses(), 'defaults': defaults(),
+                              'ports': {br: ports(br) for br in ('vmbr0', 'vmbr1', 'vmbr2', 'vmbr3')}}))
+        elif args.command.startswith('begin-'):
+            begin(args.command.split('-')[1])
+        elif args.command == 'apply':
+            apply(args.transaction)
+        elif args.command == 'confirm':
+            confirm()
+        elif args.command == 'wire-check':
+            print(json.dumps(wire_check()))
+        else:
+            rollback(args.transaction)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (Refusal, OSError, subprocess.TimeoutExpired) as error:
+        print('REFUSED: ' + str(error))
+        raise SystemExit(2)

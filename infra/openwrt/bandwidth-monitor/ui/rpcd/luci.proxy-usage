@@ -1,0 +1,164 @@
+#!/usr/bin/ucode
+// SPDX-License-Identifier: MIT
+'use strict';
+
+import { lstat, readfile } from 'fs';
+
+// Only this sanitized runtime snapshot is readable by this RPC provider.
+// No caller-supplied paths, shell commands, UCI reads or write operations.
+const STATUS_FILE = '/var/run/proxy-usage/status.json';
+const STATUS_DIR = '/var/run/proxy-usage';
+const MAX_SNAPSHOT_BYTES = 65536;
+const MAX_COUNT = 9007199254740991; // JSON / browser exact integer limit.
+
+function number_ok(v) {
+	return type(v) == 'int' && v >= 0 && v <= MAX_COUNT;
+}
+
+function text_ok(v, max) {
+	return type(v) == 'string' && length(v) <= max && !match(v, /[[:cntrl:]]/);
+}
+
+function counters(v) {
+	if (type(v) != 'object')
+		return null;
+	let out = {};
+	for (let k in [ 'upload_bytes', 'download_bytes', 'upload_packets', 'download_packets' ]) {
+		if (!number_ok(v[k]))
+			return null;
+		out[k] = v[k];
+	}
+	return out;
+}
+
+function sanitize(v) {
+	if (type(v) != 'object' || v.schema != 1 ||
+		index([ 'running', 'stopped', 'error' ], v.service) < 0 ||
+		index([ 'proxy', 'direct', 'paused' ], v.mode) < 0 ||
+		!text_ok(v.label, 256) || !text_ok(v.note, 1024) ||
+		!number_ok(v.updated_at) || !number_ok(v.saved_at) ||
+		v.interval_seconds != 30 || type(v.current_period) != 'string' || !match(v.current_period, /^[0-9]{4}-(0[1-9]|1[0-2])$/) ||
+		type(v.months) != 'array' || length(v.months) > 12 ||
+		type(v.coverage) != 'object' ||
+		index([ 'complete', 'gap', 'paused' ], v.coverage.state) < 0 ||
+		!number_ok(v.coverage.gaps) || !number_ok(v.coverage.since))
+		return null;
+
+	const total = counters(v.lifetime);
+	if (!total || type(v.rates) != 'object')
+		return null;
+	let rates = {};
+	for (let k in [ 'upload_bps', 'download_bps', 'upload_pps', 'download_pps' ]) {
+		let n = v.rates[k];
+		if ((type(n) != 'int' && type(n) != 'double') || n < 0 || n > MAX_COUNT)
+			return null;
+		rates[k] = n;
+	}
+	let coverage = {
+		state: v.coverage.state, gaps: v.coverage.gaps,
+		since: v.coverage.since, last_gap: null
+	};
+	if (v.coverage.last_gap != null) {
+		const g = v.coverage.last_gap;
+		if (type(g) != 'object' || !number_ok(g.at) || !text_ok(g.reason, 256))
+			return null;
+		coverage.last_gap = { at: g.at, reason: g.reason };
+	}
+	let transport = v.transport ?? 'hysteria2', egress_mode = v.egress_mode ?? null;
+	if (index(['hysteria2', 'wireguard'], transport) < 0 ||
+	    (egress_mode != null && index(['WG_ACTIVE', 'DIRECT_LATCHED', 'HOMEPROXY_ACTIVE'], egress_mode) < 0))
+		return null;
+	let months = [], seen = {};
+	for (let m in v.months) {
+		const c = counters(m);
+		if (!c || type(m.period) != 'string' || !match(m.period, /^[0-9]{4}-(0[1-9]|1[0-2])$/) ||
+			seen[m.period] || !number_ok(m.gaps))
+			return null;
+		seen[m.period] = true;
+		push(months, {
+			period: m.period, gaps: m.gaps,
+			upload_bytes: c.upload_bytes, download_bytes: c.download_bytes,
+			upload_packets: c.upload_packets, download_packets: c.download_packets
+		});
+	}
+	return {
+		schema: 1, service: v.service, label: v.label, mode: v.mode, transport, egress_mode,
+		updated_at: v.updated_at, saved_at: v.saved_at,
+		interval_seconds: 30, save_seconds: 3600, history_months: 12,
+		current_period: v.current_period, coverage, rates, lifetime: total, months, note: v.note
+	};
+}
+
+function snapshot() {
+	const dir = lstat(STATUS_DIR);
+	const st = lstat(STATUS_FILE);
+	if (!dir || dir.type != 'directory' || dir.uid != 0 || dir.mode != 448 ||
+		!st || st.type != 'file' || st.uid != 0 || st.mode != 384 || st.size > MAX_SNAPSHOT_BYTES)
+		return { error: 'Statistics snapshot is unavailable' };
+	let value;
+	try { value = json(readfile(STATUS_FILE)); }
+	catch (e) { return { error: 'Statistics snapshot is invalid' }; }
+	const out = sanitize(value);
+	return out ?? { error: 'Statistics snapshot is invalid' };
+}
+
+function csv_cell(v) {
+	let s = `${v}`;
+	// Prevent a spreadsheet from interpreting a label as a formula.
+	if (match(s, /^[=+@\t\r-]/))
+		s = `'${s}`;
+	return `"${replace(s, /"/g, '""')}"`;
+}
+
+function make_export(s, format, period) {
+	if (index([ 'json', 'csv' ], format) < 0 ||
+		(type(period) != 'string') ||
+		(period != 'all' && !match(period, /^[0-9]{4}-(0[1-9]|1[0-2])$/)))
+		return { error: 'Invalid export selection' };
+	let selected = filter(s.months, m => period == 'all' || m.period == period);
+	if (period != 'all' && !length(selected))
+		return { error: 'Requested period is unavailable' };
+	let data = {
+		schema: 1, label: s.label, generated_at: time(),
+		mode: s.mode, transport: s.transport, egress_mode: s.egress_mode,
+		updated_at: s.updated_at, saved_at: s.saved_at,
+		coverage: s.coverage, lifetime: s.lifetime, months: selected,
+		note: s.note
+	};
+	let content;
+	if (format == 'json')
+		content = sprintf('%J\n', data);
+	else {
+		let rows = [ 'node,period,upload_bytes,download_bytes,upload_packets,download_packets,gaps' ];
+		for (let m in selected)
+			push(rows, join(',', map([ s.label, m.period, m.upload_bytes, m.download_bytes,
+				m.upload_packets, m.download_packets, m.gaps ], csv_cell)));
+		if (period == 'all')
+			push(rows, join(',', map([ s.label, 'lifetime', s.lifetime.upload_bytes,
+				s.lifetime.download_bytes, s.lifetime.upload_packets,
+				s.lifetime.download_packets, s.coverage.gaps ], csv_cell)));
+		content = join('\r\n', rows) + '\r\n';
+	}
+	return {
+		filename: `proxy-usage-${period}.${format}`,
+		mime: format == 'csv' ? 'text/csv;charset=utf-8' : 'application/json;charset=utf-8',
+		content
+	};
+}
+
+const methods = {
+	status: { call: function() { return snapshot(); } },
+	periods: { call: function() {
+		const s = snapshot();
+		return s.error ? s : { periods: map(s.months, m => m.period), current_period: s.current_period };
+	} },
+	export: {
+		args: { format: 'json', period: 'all' },
+		call: function(req) {
+			const s = snapshot();
+			return s.error ? s : make_export(s, req.args?.format, req.args?.period);
+		}
+	}
+};
+
+return { 'luci.proxy-usage': methods };

@@ -1,0 +1,15 @@
+# Merge named zones/forwardings only after checking the existing firewall.
+# IPv6 forwarding is deliberately outside this IPv4 egress design.
+config zone 'wg_exit_zone'
+        option name 'wg_exit'
+        list network 'wg_exit'
+        option family 'ipv4'
+        option input 'REJECT'
+        option output 'ACCEPT'
+        option forward 'REJECT'
+        option masq '0'
+        option mtu_fix '1'
+
+config forwarding 'lan_to_wg_exit'
+        option src 'lan'
+        option dest 'wg_exit'

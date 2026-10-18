@@ -1,0 +1,21 @@
+[Unit]
+Description=Homepage public service availability snapshot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=nobody
+Group=nogroup
+ExecStart=/usr/bin/python3 /srv/home-tools/tools/homepage_summary.py
+Environment=PYTHONDONTWRITEBYTECODE=1
+TimeoutStartSec=20
+MemoryMax=64M
+CPUQuota=20%
+Nice=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/srv/home-tools/homepage/public/health

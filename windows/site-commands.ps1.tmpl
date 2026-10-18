@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT
+# Copyright Home Network Infra Contributors
+# Render with the repository site renderer. Invoke explicitly from the repository root.
+# This wrapper previews by default. -Apply performs the selected installation.
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$true)][ValidateSet('Coexist','TabletRdp')][string]$Component,
+    [switch]$Apply,
+    [string]$WindowsSourceDirectory=(Join-Path (Get-Location) 'windows'),
+    [string]$V2RayNConfigPath='C:\Program Files (x86)\V2RayN\guiConfigs\guiNConfig.json'
+)
+$ErrorActionPreference='Stop'
+# Enrollment endpoint: {{HEADSCALE_URL}}
+# Windows App Mobile PC name: windows-client.{{MAGICDNS_DOMAIN}}
+if ($Component -eq 'Coexist') {
+    & (Join-Path $WindowsSourceDirectory 'install-coexist.ps1') `
+        -ConfigPath $V2RayNConfigPath `
+        -ExpectedSubnetRoutes '{{UPLINK_CIDR}},{{LAN_CIDR}}' -Apply:$Apply
+} else {
+    & (Join-Path $WindowsSourceDirectory 'install-tablet-rdp-firewall.ps1') `
+        -TabletTailIP '{{TABLET_TAIL_IP}}' -WindowsTailIP '{{WINDOWS_TAIL_IP}}' -Apply:$Apply
+}

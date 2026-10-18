@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""Own a fail-closed direct route for Jellyfin and its Live TV updater.
+
+The host main table and old relay table 151 are never changed. Stopping this
+guard withdraws only its working default, leaving its unreachable default and
+firewall in place. Stop the containers before using --remove during rollback.
+"""
+import argparse
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+TABLE = 152
+SOURCES = {15200: '172.28.40.3', 15201: '172.28.40.5'}
+SUBNET = '172.28.40.0/28'
+UPLINK = 'jf-uplink'
+BRIDGE = 'br-jfmedia'
+GATEWAY = '{{UPLINK_GATEWAY}}'
+FIREWALL = 'jf_livetv_guard'
+ROOT = Path('/srv/jellyfin/livetv')
+STATE = ROOT / 'network-status.json'
+RUNTIME = ROOT / 'runtime'
+OWNER = RUNTIME / 'route-owner.json'
+FIREWALL_OWNER = RUNTIME / 'firewall-owner.json'
+LOCK = RUNTIME / 'network-guard.lock'
+RP_FILTER = Path('/proc/sys/net/ipv4/conf') / UPLINK / 'rp_filter'
+STOP = False
+IDENTITY = {'schema': 1, 'deployment': 'jellyfin-livetv', 'table': TABLE,
+            'sources': {str(k): v for k, v in SOURCES.items()},
+            'uplink': UPLINK, 'bridge': BRIDGE, 'subnet': SUBNET}
+
+
+def run(args, check=True, input=None):
+    p = subprocess.run(args, input=input, text=True, capture_output=True, timeout=10)
+    if check and p.returncode:
+        raise RuntimeError('Network command failed: ' + ' '.join(args[:4]) +
+                           ': ' + p.stderr.strip()[:300])
+    return p
+
+
+def atomic_json(path, data, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.tmp')
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
+    tmp.chmod(mode)
+    tmp.replace(path)
+
+
+def read_routes():
+    p = run(['ip', '-j', '-4', 'route', 'show', 'table', str(TABLE)], False)
+    if p.returncode and 'FIB table does not exist' not in p.stderr:
+        raise RuntimeError('Cannot inspect policy route table')
+    return json.loads(p.stdout or '[]')
+
+
+def read_rules():
+    return json.loads(run(['ip', '-j', '-4', 'rule', 'show']).stdout)
+
+
+def main_defaults():
+    raw = json.loads(run(['ip', '-j', '-4', 'route', 'show', 'table', 'main',
+                         'default']).stdout)
+    # Ignore transient lease expiry and linkdown flags, but detect route, metric,
+    # protocol, or preferred-source changes before enabling a working default.
+    keys = ('dst', 'type', 'gateway', 'dev', 'metric', 'protocol', 'prefsrc')
+    return sorted(({k: r[k] for k in keys if k in r} for r in raw),
+                  key=lambda r: json.dumps(r, sort_keys=True))
+
+
+def validate_original_default(defaults):
+    if len(defaults) != 1 or defaults[0].get('dev') != 'ens18' or \
+            defaults[0].get('gateway') != '{{LAN_GATEWAY}}':
+        raise RuntimeError('Host main default is not the expected ens18 route')
+
+
+def address_observation(data):
+    if len(data) != 1 or 'LOWER_UP' not in data[0].get('flags', []):
+        return None
+    valid = []
+    for item in data[0].get('addr_info', []):
+        if item.get('family') != 'inet' or item.get('scope') != 'global' or \
+                item.get('prefixlen') != 24:
+            continue
+        try:
+            address = ipaddress.ip_address(item.get('local', ''))
+        except ValueError:
+            continue
+        if address in ipaddress.ip_network('{{UPLINK_CIDR}}') and str(address) not in \
+                ('10.10.10.0', GATEWAY, '10.10.10.255') and \
+                not {'tentative', 'dadfailed'}.intersection(item.get('flags', [])):
+            valid.append(str(address))
+    return valid[0] if len(valid) == 1 else None
+
+
+def route_owned(route):
+    dst = route.get('dst')
+    # Every permitted route has the exact selector used by this deployment.
+    if dst == 'default' and route.get('type') == 'unreachable':
+        return route.get('metric') == 32760 and not route.get('gateway')
+    if dst == 'default':
+        return route.get('gateway') == GATEWAY and route.get('dev') == UPLINK and \
+            route.get('metric') == 100 and route.get('type', 'unicast') == 'unicast'
+    return (dst == '{{UPLINK_CIDR}}' and route.get('dev') == UPLINK or
+            dst == SUBNET and route.get('dev') == BRIDGE) and \
+        not route.get('gateway') and route.get('scope') == 'link' and \
+        route.get('type', 'unicast') == 'unicast'
+
+
+def validate_rules(rules):
+    for priority, source in SOURCES.items():
+        same = [r for r in rules if r.get('priority') == priority]
+        if same and (len(same) != 1 or str(same[0].get('table')) != str(TABLE) or
+                     same[0].get('src') not in (source, source + '/32') or
+                     any(k not in ('priority', 'src', 'table', 'protocol', 'flags')
+                         for k in same[0]) or same[0].get('flags', [])):
+            raise RuntimeError('Policy rule priority conflict: ' + str(priority))
+    for rule in rules:
+        if str(rule.get('table')) == str(TABLE) and rule.get('priority') not in SOURCES:
+            raise RuntimeError('Foreign rule references the Live TV route table')
+
+
+def load_owner():
+    owner = json.loads(OWNER.read_text())
+    if owner.get('identity') != IDENTITY or not isinstance(owner.get('main_defaults'), list):
+        raise RuntimeError('Invalid or foreign route ownership file')
+    return owner
+
+
+def ensure_owned_resources():
+    routes, rules = read_routes(), read_rules()
+    validate_rules(rules)
+    if not OWNER.exists():
+        # An exact-looking resource is still foreign without our ownership file.
+        if routes or any(r.get('priority') in SOURCES or str(r.get('table')) == str(TABLE)
+                         for r in rules):
+            raise RuntimeError('Route table or rules already exist without ownership')
+        if FIREWALL_OWNER.exists():
+            raise RuntimeError('Orphan firewall ownership file requires inspection')
+        defaults = main_defaults()
+        validate_original_default(defaults)
+        owner = {'identity': IDENTITY, 'main_defaults': defaults,
+                 'original_rp_filter': RP_FILTER.read_text().strip() if RP_FILTER.exists() else None}
+        atomic_json(OWNER, owner)
+    else:
+        owner = load_owner()
+    if not all(route_owned(route) for route in routes):
+        raise RuntimeError('Foreign route in Live TV policy table')
+    return owner
+
+
+def firewall_text():
+    return '''table inet jf_livetv_guard {
+  comment "jellyfin-livetv guard v1"
+  counter blocked_non_lan {}
+  counter blocked_internal_access {}
+  counter wrong_egress {}
+  counter cross_network_forward {}
+  counter direct_out {}
+  counter direct_in {}
+  chain input {
+    type filter hook input priority -10; policy accept;
+    meta nfproto ipv6 tcp dport 8096 counter name blocked_non_lan drop
+    tcp dport 8096 ip saddr != { {{UPLINK_CIDR}}, {{LAN_CIDR}} } counter name blocked_non_lan drop
+  }
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    meta nfproto ipv6 tcp dport 8096 counter name blocked_non_lan drop
+    meta nfproto ipv6 iifname "br-jfmedia" counter name wrong_egress drop
+    meta nfproto ipv6 oifname "br-jfmedia" counter name blocked_internal_access drop
+    iifname "ens18" oifname "jf-uplink" counter name cross_network_forward drop
+    iifname "jf-uplink" oifname "ens18" counter name cross_network_forward drop
+    ip saddr { 172.28.40.3, 172.28.40.5 } oifname != { "jf-uplink", "br-jfmedia" } counter name wrong_egress drop
+    ip saddr { 172.28.40.3, 172.28.40.5 } oifname "jf-uplink" counter name direct_out
+    ip daddr { 172.28.40.3, 172.28.40.5 } iifname "jf-uplink" counter name direct_in
+    ip saddr { 172.28.40.4, 172.28.40.6 } oifname != "br-jfmedia" ct state != { established, related } counter name wrong_egress drop
+    iifname { "ens18", "jf-uplink" } ip daddr 172.28.40.0/28 ip daddr != 172.28.40.4 ct state != { established, related } counter name blocked_internal_access drop
+    iifname { "ens18", "jf-uplink" } ip daddr 172.28.40.4 ip saddr != { {{UPLINK_CIDR}}, {{LAN_CIDR}} } counter name blocked_non_lan drop
+    iifname { "ens18", "jf-uplink" } ip daddr 172.28.40.4 meta l4proto != tcp counter name blocked_internal_access drop
+    iifname { "ens18", "jf-uplink" } ip daddr 172.28.40.4 tcp dport != 8096 counter name blocked_internal_access drop
+    ip daddr 172.28.40.4 tcp dport 8096 ip saddr != { {{UPLINK_CIDR}}, {{LAN_CIDR}}, 172.28.40.0/28 } counter name blocked_non_lan drop
+  }
+}
+'''
+
+
+def effective_firewall_text():
+    text = firewall_text()
+    text = text.replace(
+        '    type filter hook input priority -10; policy accept;\n',
+        '    type filter hook input priority -10; policy accept;\n'
+        '    iifname "tailscale0" ip saddr {{LINUX_TAIL_IP}} tcp dport 8096 ct state { new, established } accept\n', 1)
+    return text.replace(
+        '    type filter hook forward priority -10; policy accept;\n',
+        '    type filter hook forward priority -10; policy accept;\n'
+        '    iifname "tailscale0" oifname "br-jfmedia" ip saddr {{LINUX_TAIL_IP}} ip daddr 172.28.40.4 tcp dport 8096 ct state { new, established } accept\n', 1)
+
+
+TAILSCALE_PRIMARY_CLIENT = '{{LINUX_TAIL_IP}}'
+TAILSCALE_MEMBERSHIP = Path('/var/lib/headscale-lan-guard-migration/migration.json')
+
+
+def authorized_client_addresses(values=None):
+    import ipaddress
+    import stat
+    if values is None:
+        directory = TAILSCALE_MEMBERSHIP.parent.lstat()
+        info = TAILSCALE_MEMBERSHIP.lstat()
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != 0 or
+                stat.S_IMODE(directory.st_mode) != 0o700 or
+                not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or
+                stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1 or info.st_size > 1048576):
+            raise RuntimeError('Unsafe Tailscale membership record')
+        record = json.loads(TAILSCALE_MEMBERSHIP.read_text())
+        if (record.get('schema') != 1 or record.get('client_ip') != TAILSCALE_PRIMARY_CLIENT or
+                record.get('state') not in ('PREPARED', 'RESUMING', 'ACTIVE')):
+            raise RuntimeError('Tailscale membership record is not an owned active transition')
+        values = record.get('client_ips', [TAILSCALE_PRIMARY_CLIENT])
+    if not isinstance(values, (list, tuple)) or not 1 <= len(values) <= 16:
+        raise RuntimeError('Invalid Tailscale client list')
+    addresses = []
+    for value in values:
+        try:
+            network = ipaddress.ip_network(value if '/' in value else value + '/32', strict=True)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError('Invalid Tailscale client /32') from error
+        if (network.version != 4 or network.prefixlen != 32 or
+                network.network_address not in ipaddress.ip_network('100.64.0.0/10')):
+            raise RuntimeError('Client must be one Tailscale IPv4 /32')
+        addresses.append(str(network.network_address))
+    canonical = sorted(set(addresses), key=ipaddress.ip_address)
+    if TAILSCALE_PRIMARY_CLIENT not in canonical or list(values) != canonical:
+        raise RuntimeError('Tailscale clients must be canonical and retain the primary client')
+    return canonical
+
+
+def client_firewall_text(addresses=None):
+    addresses = authorized_client_addresses(addresses)
+    text = firewall_text()
+    for chain in ('input', 'forward'):
+        header = '    type filter hook ' + chain + ' priority -10; policy accept;\n'
+        rules = []
+        for address in addresses:
+            rule = '    iifname "tailscale0" '
+            if chain == 'forward':
+                rule += 'oifname "br-jfmedia" '
+            rule += 'ip saddr ' + address + ' '
+            if chain == 'forward':
+                rule += 'ip daddr 172.28.40.4 '
+            rules.append(rule + 'tcp dport 8096 ct state { new, established } accept\n')
+        if text.count(header) != 1:
+            raise RuntimeError('Unexpected base firewall template')
+        text = text.replace(header, header + ''.join(rules), 1)
+    return text
+
+
+def firewall_identity(raw):
+    def normalize(obj):
+        if isinstance(obj, list):
+            return [normalize(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: normalize(v) for k, v in obj.items()
+                    if k not in ('handle', 'index', 'packets', 'bytes')}
+        return obj
+    objects = [normalize(item) for item in json.loads(raw)['nftables']
+               if 'metainfo' not in item]
+    return hashlib.sha256(json.dumps(objects, sort_keys=True).encode()).hexdigest()
+
+
+def current_firewall():
+    p = run(['nft', '-j', 'list', 'table', 'inet', FIREWALL], False)
+    if p.returncode:
+        if 'No such file or directory' not in p.stderr:
+            raise RuntimeError('Cannot inspect Live TV firewall')
+        return None
+    return firewall_identity(p.stdout)
+
+
+def validate_firewall(check_template=True):
+    current = current_firewall()
+    if current is not None:
+        if not FIREWALL_OWNER.exists():
+            raise RuntimeError('Firewall table collision without ownership')
+        owned = json.loads(FIREWALL_OWNER.read_text())
+        if owned.get('table') != FIREWALL or owned.get('identity') != current:
+            raise RuntimeError('Live TV firewall changed unexpectedly')
+        template = hashlib.sha256(firewall_text().encode()).hexdigest()
+        if check_template and owned.get('template_sha256') != template:
+            raise RuntimeError('Firewall template changed; explicit migration required')
+        extension = owned.get('tailscale_template_sha256')
+        if check_template and extension is not None and extension != hashlib.sha256(effective_firewall_text().encode()).hexdigest():
+            raise RuntimeError('Tailscale firewall template changed; explicit migration required')
+        complete = owned.get('tailscale_clients_template_sha256')
+        if check_template and complete is not None:
+            clients = authorized_client_addresses()
+            if owned.get('tailscale_client_ips') != clients or complete != hashlib.sha256(client_firewall_text(clients).encode()).hexdigest():
+                raise RuntimeError('Tailscale membership/template changed; explicit migration required')
+    return current
+
+
+def ensure_firewall():
+    if validate_firewall() is not None:
+        return
+    base = firewall_text()
+    previous = json.loads(FIREWALL_OWNER.read_text()) if FIREWALL_OWNER.exists() else None
+    extended = previous is None or 'tailscale_template_sha256' in previous
+    multi = previous is not None and 'tailscale_clients_template_sha256' in previous
+    clients = authorized_client_addresses() if multi else None
+    text = client_firewall_text(clients) if multi else (effective_firewall_text() if extended else base)
+    run(['nft', '-c', '-f', '-'], input=text)
+    run(['nft', '-f', '-'], input=text)
+    receipt = {'table': FIREWALL, 'identity': current_firewall(),
+               'template_sha256': hashlib.sha256(base.encode()).hexdigest()}
+    if extended:
+        receipt['tailscale_template_sha256'] = hashlib.sha256(effective_firewall_text().encode()).hexdigest()
+    if multi:
+        receipt['tailscale_client_ips'] = clients
+        receipt['tailscale_clients_template_sha256'] = hashlib.sha256(text.encode()).hexdigest()
+    atomic_json(FIREWALL_OWNER, receipt)
+
+
+def ensure_rule():
+    rules = read_rules()
+    validate_rules(rules)
+    for priority, source in SOURCES.items():
+        if not any(rule.get('priority') == priority for rule in rules):
+            run(['ip', '-4', 'rule', 'add', 'priority', str(priority), 'from', source + '/32',
+                 'lookup', str(TABLE)])
+
+
+def withdraw_default():
+    """Best-effort removal of our working route; never remove a foreign route."""
+    if not OWNER.exists():
+        return
+    load_owner()
+    for route in read_routes():
+        if route.get('dst') == 'default' and route.get('gateway') and route_owned(route):
+            run(['ip', '-4', 'route', 'del', 'default', 'via', GATEWAY, 'dev', UPLINK,
+                 'table', str(TABLE), 'metric', '100'])
+
+
+def atomic_status(data):
+    data.update(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                updated_monotonic=time.monotonic(), updated_unix=time.time(),
+                table=TABLE, interface=UPLINK, gateway=GATEWAY,
+                sources=list(SOURCES.values()), fallback_to_original_interface=False)
+    atomic_json(STATE, data, 0o644)
+    STATE.parent.chmod(0o755)
+
+
+def update():
+    owner = ensure_owned_resources()
+    # Firewall precedes all rules and working routes. Even if a rule is changed
+    # externally, this prevents these two sources leaving through ens18.
+    ensure_firewall()
+    run(['ip', '-4', 'route', 'replace', 'unreachable', 'default', 'table', str(TABLE),
+         'metric', '32760'])
+    ensure_rule()
+    if main_defaults() != owner['main_defaults']:
+        withdraw_default()
+        raise RuntimeError('Host main default changed; direct default withdrawn')
+    p = run(['ip', '-j', '-4', 'addr', 'show', 'dev', UPLINK], False)
+    address = address_observation(json.loads(p.stdout or '[]')) if p.returncode == 0 else None
+    if run(['ip', 'link', 'show', 'dev', BRIDGE], False).returncode == 0:
+        run(['ip', '-4', 'route', 'replace', SUBNET, 'dev', BRIDGE, 'scope', 'link',
+             'table', str(TABLE)])
+    if address:
+        run(['sysctl', '-q', '-w', 'net.ipv4.conf.' + UPLINK + '.rp_filter=2'])
+        run(['ip', '-4', 'route', 'replace', '{{UPLINK_CIDR}}', 'dev', UPLINK,
+             'scope', 'link', 'table', str(TABLE)])
+        run(['ip', '-4', 'route', 'replace', 'default', 'via', GATEWAY, 'dev', UPLINK,
+             'src', address, 'table', str(TABLE), 'metric', '100'])
+    else:
+        withdraw_default()
+    atomic_status({'status': 'DIRECT_READY' if address else 'WAITING_UPLINK',
+                   'address': address})
+    return address
+
+
+def remove():
+    if not OWNER.exists():
+        if read_routes() or any(r.get('priority') in SOURCES or str(r.get('table')) == str(TABLE)
+                                for r in read_rules()) or current_firewall() is not None:
+            raise RuntimeError('Resources exist without ownership; refusing to remove')
+        return
+    owner = load_owner()
+    routes, rules = read_routes(), read_rules()
+    if not all(route_owned(route) for route in routes):
+        raise RuntimeError('Foreign route present; refusing to remove')
+    validate_rules(rules)
+    firewall = validate_firewall(check_template=False)
+    withdraw_default()
+    for priority, source in SOURCES.items():
+        if any(r.get('priority') == priority for r in rules):
+            run(['ip', '-4', 'rule', 'del', 'priority', str(priority), 'from', source + '/32',
+                 'lookup', str(TABLE)])
+    # Full validation above proves this table contains only this deployment's
+    # routes. No host defaults, table 151, interfaces, or Docker rules are touched.
+    run(['ip', '-4', 'route', 'flush', 'table', str(TABLE)], False)
+    original = owner.get('original_rp_filter')
+    if original is not None and RP_FILTER.exists() and RP_FILTER.read_text().strip() == '2':
+        run(['sysctl', '-q', '-w', 'net.ipv4.conf.' + UPLINK + '.rp_filter=' + original])
+    if firewall is not None:
+        run(['nft', 'delete', 'table', 'inet', FIREWALL])
+    FIREWALL_OWNER.unlink(missing_ok=True)
+    OWNER.unlink()
+    atomic_status({'status': 'REMOVED', 'address': None})
+
+
+def status():
+    """Read-only and unprivileged: never create paths, locks, or ownership."""
+    if not STATE.exists():
+        print(json.dumps({'status': 'NOT_INITIALIZED', 'table': TABLE}))
+        return 3
+    data = json.loads(STATE.read_text())
+    same_boot = data.get('boot_id') == Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    age = time.monotonic() - data.get('updated_monotonic', float('-inf'))
+    fresh = same_boot and 0 <= age <= 30
+    data.update(status_fresh=fresh, status_age_seconds=round(age, 1) if same_boot else None)
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0 if fresh and data.get('status') == 'DIRECT_READY' else 3
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--once', action='store_true')
+    group.add_argument('--status', action='store_true')
+    group.add_argument('--remove', action='store_true')
+    args = parser.parse_args()
+    if args.status:
+        return status()
+    if os.geteuid() != 0:
+        raise SystemExit('Root required')
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    RUNTIME.chmod(0o700)
+    with LOCK.open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit('Another Live TV guard operation is running')
+        if args.remove:
+            remove()
+            return 0
+
+        def stop(*_):
+            global STOP
+            STOP = True
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        try:
+            while not STOP:
+                try:
+                    update()
+                except Exception as error:
+                    closing_error = None
+                    try:
+                        withdraw_default()
+                    except Exception as close_error:
+                        closing_error = str(close_error)
+                    atomic_status({'status': 'ERROR', 'reason': str(error),
+                                   'close_error': closing_error, 'address': None})
+                    print(str(error), file=sys.stderr, flush=True)
+                    if args.once:
+                        return 1
+                if args.once:
+                    return 0
+                # One-second slices allow timely SIGTERM without a busy loop.
+                for _ in range(5):
+                    if STOP:
+                        break
+                    time.sleep(1)
+        finally:
+            if not args.once:
+                withdraw_default()
+                atomic_status({'status': 'STOPPED_CLOSED', 'address': None})
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

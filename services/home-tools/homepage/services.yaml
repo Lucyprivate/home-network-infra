@@ -1,0 +1,116 @@
+- Applications:
+  - Jellyfin:
+      href: http://10.10.10.42:8096
+      description: Watch live TV and browse your media.
+      icon: mdi-apps
+      widget:
+        type: customapi
+        url: http://127.0.0.1:3000/icons/health/status.json
+        refreshInterval: 30000
+        mappings:
+        - field: services.jellyfin.state
+          label: Status
+          remap:
+          - value: Online
+            to: 🟢 Online
+          - value: Offline
+            to: 🔴 Offline
+        - field: checked_at
+          label: Checked
+          format: relativeDate
+  - Stirling PDF:
+      href: http://10.10.10.42:8080
+      description: Edit, convert, and search scanned PDFs.
+      icon: mdi-apps
+      widget:
+        type: customapi
+        url: http://127.0.0.1:3000/icons/health/status.json
+        refreshInterval: 30000
+        mappings:
+        - field: services.stirling.state
+          label: Status
+          remap:
+          - value: Online
+            to: 🟢 Online
+          - value: Offline
+            to: 🔴 Offline
+        - field: checked_at
+          label: Checked
+          format: relativeDate
+  - FileBrowser Quantum:
+      href: http://10.10.10.42:8081
+      description: Upload, download, and organize your shared files.
+      icon: mdi-apps
+      widget:
+        type: customapi
+        url: http://127.0.0.1:3000/icons/health/status.json
+        refreshInterval: 30000
+        mappings:
+        - field: services.filebrowser.state
+          label: Status
+          remap:
+          - value: Online
+            to: 🟢 Online
+          - value: Offline
+            to: 🔴 Offline
+        - field: checked_at
+          label: Checked
+          format: relativeDate
+- Management:
+  - Portainer:
+      href: https://10.10.10.42:9443
+      description: Manage your applications and containers.
+      icon: mdi-apps
+      widget:
+        type: customapi
+        url: http://127.0.0.1:3000/icons/health/status.json
+        refreshInterval: 30000
+        mappings:
+        - field: services.portainer.state
+          label: Status
+          remap:
+          - value: Online
+            to: 🟢 Online
+          - value: Offline
+            to: 🔴 Offline
+        - field: checked_at
+          label: Checked
+          format: relativeDate
+  - PVE:
+      href: https://10.10.10.10:8006
+      description: Manage virtual machines and server resources.
+      icon: mdi-apps
+      widget:
+        type: customapi
+        url: http://127.0.0.1:3000/icons/health/status.json
+        refreshInterval: 30000
+        mappings:
+        - field: services.pve.state
+          label: Status
+          remap:
+          - value: Online
+            to: 🟢 Online
+          - value: Offline
+            to: 🔴 Offline
+        - field: checked_at
+          label: Checked
+          format: relativeDate
+  - OpenWrt:
+      href: http://10.10.20.1
+      description: Manage your home network and router.
+      icon: mdi-apps
+      widget:
+        type: customapi
+        url: http://127.0.0.1:3000/icons/health/status.json
+        refreshInterval: 30000
+        mappings:
+        - field: services.openwrt.state
+          label: Status
+          remap:
+          - value: Online
+            to: 🟢 Online
+          - value: Offline
+            to: 🔴 Offline
+        - field: checked_at
+          label: Checked
+          format: relativeDate

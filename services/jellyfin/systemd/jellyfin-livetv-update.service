@@ -1,0 +1,12 @@
+[Unit]
+Description=Jellyfin public Live TV full update
+Requires=docker.service jellyfin-livetv-guard.service
+After=docker.service jellyfin-livetv-guard.service
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /srv/jellyfin/tools/livetv/update_job.py --mode full
+TimeoutStartSec=1100
+Nice=10
+IOSchedulingClass=idle
+UMask=0027

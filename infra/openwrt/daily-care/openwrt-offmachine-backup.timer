@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenWrt VM100 off-machine backup schedule
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+OnStartupSec=10min
+Persistent=true
+RandomizedDelaySec=2min
+AccuracySec=1min
+Unit=openwrt-offmachine-backup.service
+
+[Install]
+WantedBy=timers.target

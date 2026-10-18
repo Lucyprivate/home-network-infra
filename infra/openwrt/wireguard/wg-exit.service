@@ -1,0 +1,21 @@
+[Unit]
+Description=Private OpenWrt WireGuard egress
+After=network-online.target firewalld.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wireguard-go -f wg_exit
+ExecStartPost=/usr/local/libexec/wg-exit-link
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=15
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

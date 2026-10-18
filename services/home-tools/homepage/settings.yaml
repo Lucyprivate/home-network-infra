@@ -1,0 +1,18 @@
+title: Home Dashboard
+description: Your home services in one place.
+language: en
+theme: dark
+color: slate
+target: _blank
+disableUpdateCheck: true
+disableIndexing: true
+layout:
+  Applications:
+    style: row
+    columns: 3
+  Management:
+    style: row
+    columns: 3
+statusStyle: dot
+hideVersion: true
+headerStyle: clean

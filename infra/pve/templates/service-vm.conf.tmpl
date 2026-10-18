@@ -1,0 +1,12 @@
+# Selected settings only. Determine the actual PCI function/IOMMU group locally.
+# A PCI address or guest machine identity must never be copied from another host.
+name: service-host
+cores: 3
+memory: 4096
+onboot: 1
+startup: order=2
+agent: enabled=1
+serial0: socket
+net0: virtio,bridge=vmbr0,firewall=1
+net1: virtio={{APP_LAN_MAC}},bridge=vmbr1,firewall=1
+# Set hostpci0 manually only after reviewing the actual IOMMU group and console.

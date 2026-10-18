@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "services": {
+    "portainer": {
+      "version": "2.45.2",
+      "image_tag": "portainer/portainer-ce:2.45.2",
+      "official_sources": {
+        "release": "https://github.com/portainer/portainer/releases/tag/2.45.2",
+        "installation": "https://docs.portainer.io/start/install-ce/server/docker/linux",
+        "compatibility": "https://docs.portainer.io/start/requirements-and-prerequisites",
+        "cli_and_admin_initialization": "https://docs.portainer.io/advanced/cli",
+        "setup_token": "https://docs.portainer.io/faqs/installing/setup-token"
+      }
+    },
+    "filebrowser": {
+      "version": "2.0.1-stable",
+      "image_tag": "gtstef/filebrowser:2.0.1-stable",
+      "official_sources": {
+        "release": "https://github.com/gtsteffaniak/filebrowser/releases/tag/v2.0.1-stable",
+        "docker": "https://filebrowserquantum.com/en/docs/getting-started/docker/",
+        "configuration": "https://filebrowserquantum.com/en/docs/configuration/",
+        "source": "https://github.com/gtsteffaniak/filebrowser/tree/v2.0.1-stable"
+      }
+    },
+    "homepage": {
+      "version": "2.5.0",
+      "image_tag": "ghcr.io/gethomepage/homepage:v2.5.0",
+      "official_sources": {
+        "release": "https://github.com/gethomepage/homepage/releases/tag/v2.5.0",
+        "installation_and_allowed_hosts": "https://gethomepage.dev/installation/",
+        "docker": "https://gethomepage.dev/installation/docker/",
+        "settings": "https://gethomepage.dev/configs/settings/",
+        "services": "https://gethomepage.dev/configs/services/",
+        "container_and_healthcheck": "https://github.com/gethomepage/homepage/blob/v2.5.0/Dockerfile",
+        "resources": "https://gethomepage.dev/widgets/info/resources/",
+        "custom_api": "https://gethomepage.dev/widgets/services/customapi/",
+        "icons": "https://gethomepage.dev/configs/services/"
+      }
+    }
+  }
+}

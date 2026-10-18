@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "description": "Optional extra language model for a staged native Tesseract installation; no model bytes included.",
+  "model": {
+    "language": "chi_tra",
+    "repository": "tesseract-ocr/tessdata_fast",
+    "commit": "87416418657359cb625c412a48b6e1d6d41c29bd",
+    "source_url": "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/87416418657359cb625c412a48b6e1d6d41c29bd/chi_tra.traineddata",
+    "bytes": 2366642,
+    "sha256": "529c5b5797d64b126065cd55f2bb4c7fd7b15790798091b1ff259941a829330b"
+  }
+}

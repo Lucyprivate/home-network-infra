@@ -1,0 +1,15 @@
+# netifd template: credentials are intentionally empty and provisioned privately.
+# route_allowed_ips=0 is essential: vpn-egress owns policy routing.
+config interface 'wg_exit'
+        option proto 'wireguard'
+        option private_key ''
+        list addresses '{{WG_CLIENT_IP}}/30'
+        option mtu '1380'
+
+config wireguard_wg_exit 'exit_peer'
+        option public_key ''
+        option endpoint_host '{{VPS_PUBLIC_IP}}'
+        option endpoint_port '{{WG_PORT}}'
+        option persistent_keepalive '25'
+        option route_allowed_ips '0'
+        list allowed_ips '0.0.0.0/0'

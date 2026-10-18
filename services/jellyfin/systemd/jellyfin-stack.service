@@ -1,0 +1,17 @@
+[Unit]
+Description=ServiceHost Jellyfin Live TV and LAN gateway
+Requires=docker.service jellyfin-livetv-guard.service
+After=docker.service jellyfin-livetv-guard.service
+BindsTo=docker.service jellyfin-livetv-guard.service
+PartOf=docker.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/srv/jellyfin
+ExecStartPre=/usr/bin/python3 /srv/jellyfin/tools/livetv/network_guard.py --status
+ExecStart=/usr/bin/docker compose -f /srv/jellyfin/compose.live.yaml up -d jellyfin playback-lock gateway
+ExecStop=/usr/bin/docker compose -f /srv/jellyfin/compose.live.yaml stop --timeout 25 gateway playback-lock jellyfin
+TimeoutStartSec=120
+TimeoutStopSec=90
+[Install]
+WantedBy=multi-user.target docker.service

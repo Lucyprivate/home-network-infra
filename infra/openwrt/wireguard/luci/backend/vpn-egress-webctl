@@ -1,0 +1,224 @@
+#!/bin/sh
+# Only the two fixed egress actions are exposed to rpcd. procd owns the worker.
+set -u
+umask 077
+
+RUN=${VPEWEB_RUN:-/var/run/vpn-egress-web}
+SELF=${VPEWEB_SELF:-/usr/libexec/vpn-egress-webctl}
+CONTROLLER=${VPEWEB_CONTROLLER:-/usr/sbin/vpn-egress}
+TIMEOUT=${VPEWEB_TIMEOUT:-/usr/bin/timeout}
+UBUS=${VPEWEB_UBUS:-/bin/ubus}
+JSON=${VPEWEB_JSON:-/usr/bin/jsonfilter}
+FLOCK=${VPEWEB_FLOCK:-/usr/bin/flock}
+ID=${VPEWEB_ID:-/usr/bin/id}
+STAT=${VPEWEB_STAT:-/bin/stat}
+BOOT_FILE=${VPEWEB_BOOT_FILE:-/proc/sys/kernel/random/boot_id}
+UUID_FILE=${VPEWEB_UUID_FILE:-/proc/sys/kernel/random/uuid}
+STATE=$RUN/operation.json
+LOCK=$RUN/queue.lock
+LOCKED=0
+CHILD=
+
+error() { printf '{"error":"%s"}\n' "$1"; return 1; }
+utc() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+epoch() { date -u '+%s'; }
+uuid_ok() { printf '%s\n' "$1" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; }
+number_ok() { case "$1" in ''|*[!0-9]*) return 1;; esac; [ ${#1} -le 12 ]; }
+action_ok() { case "$1" in direct|resume) return 0;; *) return 1;; esac; }
+field() { "$JSON" -s "$OP_JSON" -e "@$1" 2>/dev/null; }
+unlock() { [ "$LOCKED" = 0 ] || { "$FLOCK" -u 9; exec 9>&-; LOCKED=0; }; }
+lock() {
+ exec 9<>"$LOCK" || return 1
+ if ! "$FLOCK" -n 9; then exec 9>&-; return 1; fi
+ LOCKED=1
+}
+worker_lock() {
+ n=0
+ while ! lock; do n=$((n + 1)); [ "$n" -lt 12 ] || return 1; sleep 1; done
+}
+
+preflight() {
+ [ "$("$ID" -u 2>/dev/null)" = 0 ] || { error 'Root access is required'; return 1; }
+ for c in "$TIMEOUT" "$UBUS" "$JSON" "$FLOCK" "$STAT" date grep cat mkdir mv rm chmod sleep tr; do
+  command -v "$c" >/dev/null 2>&1 || { error 'A required tool is unavailable'; return 1; }
+ done
+ # Do this before creating state: BusyBox/coreutils versions differ in flags.
+ "$TIMEOUT" -k 1 1 /bin/true >/dev/null 2>&1 || { error 'The timeout wrapper is incompatible'; return 1; }
+ BOOT=$(cat "$BOOT_FILE" 2>/dev/null) || { error 'Boot identity is unavailable'; return 1; }
+ uuid_ok "$BOOT" || { error 'Boot identity is invalid'; return 1; }
+}
+
+private_paths() {
+ [ ! -L "$RUN" ] || { error 'The private directory is unsafe'; return 1; }
+ if [ ! -e "$RUN" ]; then
+  [ "$1" != status ] || return 0
+  mkdir -m 700 "$RUN" 2>/dev/null || { error 'The private directory is unavailable'; return 1; }
+ fi
+ [ -d "$RUN" ] && [ "$("$STAT" -c '%u:%a' "$RUN" 2>/dev/null)" = '0:700' ] || { error 'The private directory is unsafe'; return 1; }
+ for p in "$STATE" "$LOCK" "$RUN/execution.lock"; do
+  [ ! -L "$p" ] || { error 'A private state path is unsafe'; return 1; }
+  if [ -e "$p" ]; then
+   [ -f "$p" ] && [ "$("$STAT" -c '%u:%a' "$p" 2>/dev/null)" = '0:600' ] || { error 'A private state path is unsafe'; return 1; }
+  fi
+ done
+ if [ "$1" != status ]; then
+  for p in "$LOCK" "$RUN/execution.lock"; do
+   if [ ! -e "$p" ]; then (set -C; : > "$p") 2>/dev/null || { error 'The operation lock is unavailable'; return 1; }; fi
+  done
+ fi
+}
+
+empty_operation() {
+ OP_ID=; OP_ACTION=; OP_BOOT=$BOOT; OP_STARTED=0; OP_START_UTC=; OP_COMPLETED=; OP_RESULT=none; OP_RUNNING=false; OP_EXIT=
+}
+
+load_operation() {
+ empty_operation
+ [ -e "$STATE" ] || return 0
+ size=$("$STAT" -c '%s' "$STATE" 2>/dev/null) || return 1
+ number_ok "$size" && [ "$size" -le 2048 ] || return 1
+ OP_JSON=$(cat "$STATE") || return 1
+ [ "$(field .schema)" = 1 ] || return 1
+ OP_ID=$(field .id); uuid_ok "$OP_ID" || return 1
+ OP_ACTION=$(field .action); action_ok "$OP_ACTION" || return 1
+ OP_BOOT=$(field .boot_id); uuid_ok "$OP_BOOT" || return 1
+ OP_STARTED=$(field .started_epoch); number_ok "$OP_STARTED" || return 1
+ OP_START_UTC=$(field .started_utc)
+ printf '%s\n' "$OP_START_UTC" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || return 1
+ OP_COMPLETED=$(field .completed_utc)
+ [ "$OP_COMPLETED" != null ] || OP_COMPLETED=
+ [ -z "$OP_COMPLETED" ] || printf '%s\n' "$OP_COMPLETED" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' || return 1
+ OP_RUNNING=$(field .running); case "$OP_RUNNING" in true|false) :;; *) return 1;; esac
+ OP_RESULT=$(field .result); case "$OP_RESULT" in pending|success|failed|timed_out|interrupted) :;; *) return 1;; esac
+ OP_EXIT=$(field .exit_code); [ "$OP_EXIT" != null ] || OP_EXIT=
+ [ -z "$OP_EXIT" ] || { number_ok "$OP_EXIT" && [ "$OP_EXIT" -le 255 ]; } || return 1
+ [ "$OP_RUNNING:$OP_RESULT" = true:pending ] || { [ "$OP_RUNNING" = false ] && [ "$OP_RESULT" != pending ]; } || return 1
+}
+
+nullable() { if [ -z "$1" ]; then printf null; else printf '"%s"' "$1"; fi; }
+operation_json() {
+ printf '{"schema":1,"running":%s,"action":%s,"id":%s,"boot_id":"%s","started_epoch":%s,"started_utc":%s,"completed_utc":%s,"result":"%s","exit_code":%s}' \
+  "$OP_RUNNING" "$(nullable "$OP_ACTION")" "$(nullable "$OP_ID")" "$OP_BOOT" "$OP_STARTED" "$(nullable "$OP_START_UTC")" "$(nullable "$OP_COMPLETED")" "$OP_RESULT" "${OP_EXIT:-null}"
+}
+
+save_operation() {
+ tmp=$RUN/.operation.$OP_ID.$$
+ [ ! -e "$tmp" ] && [ ! -L "$tmp" ] || return 1
+ (set -C; operation_json > "$tmp") || return 1
+ chmod 600 "$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
+}
+
+query_service() {
+ # The query and all selectors are fixed, unrelated to any browser argument.
+ SERVICE_JSON=$("$TIMEOUT" -k 1 5 "$UBUS" -S call service list '{"name":"vpn-egress-web"}' 2>/dev/null) || return 1
+ "$JSON" -s "$SERVICE_JSON" -e '@' >/dev/null 2>&1 || return 1
+ SERVICE_RUNNING=$("$JSON" -s "$SERVICE_JSON" -e '@["vpn-egress-web"].instances.operation.running' 2>/dev/null)
+ case "$SERVICE_RUNNING" in ''|false) SERVICE_RUNNING=false;; true) :;; *) return 1;; esac
+ SERVICE_ID=$("$JSON" -s "$SERVICE_JSON" -e '@["vpn-egress-web"].instances.operation.command[3]' 2>/dev/null)
+ SERVICE_ACTION=$("$JSON" -s "$SERVICE_JSON" -e '@["vpn-egress-web"].instances.operation.command[2]' 2>/dev/null)
+ SERVICE_WORKER=$("$JSON" -s "$SERVICE_JSON" -e '@["vpn-egress-web"].instances.operation.command[1]' 2>/dev/null)
+ SERVICE_EXEC=$("$JSON" -s "$SERVICE_JSON" -e '@["vpn-egress-web"].instances.operation.command[0]' 2>/dev/null)
+ # command is [SELF, worker, ACTION, UUID]; do not expose its contents.
+ return 0
+}
+
+normalize_operation() {
+ [ "$OP_RUNNING" = true ] || return 0
+ now=$(epoch); number_ok "$now" || return 1
+ age=$((now - OP_STARTED))
+ if [ "$OP_BOOT" = "$BOOT" ] && [ "$age" -ge 0 ]; then
+  [ "$SERVICE_RUNNING" != true ] || [ "$SERVICE_ID" != "$OP_ID" ] || return 0
+  [ "$age" -gt 5 ] || return 0
+ fi
+ OP_RUNNING=false; OP_RESULT=interrupted; OP_COMPLETED=$(utc); OP_EXIT=
+ # Status normalization is in-memory: a read-only LuCI user never writes state.
+ return 0
+}
+
+status() {
+ load_operation || { error 'Operation state is invalid'; return 1; }
+ query_service || { error 'Operation service status is unavailable'; return 1; }
+ normalize_operation || { error 'Operation state could not be updated'; return 1; }
+ printf '{"operation":'; operation_json; printf '}\n'
+}
+
+submit() {
+ action=$1
+ lock || { error 'Another operation is being prepared'; return 1; }
+ load_operation || { error 'Operation state is invalid'; return 1; }
+ query_service || { error 'Operation service status is unavailable'; return 1; }
+ normalize_operation || { error 'Operation state could not be updated'; return 1; }
+ [ "$SERVICE_RUNNING" = false ] && [ "$OP_RUNNING" = false ] || { error 'An egress operation is already running'; return 1; }
+ exec 8<>"$RUN/execution.lock" || { error 'The worker lock is unavailable'; return 1; }
+ "$FLOCK" -n 8 || { error 'An egress worker is still running'; return 1; }
+ "$FLOCK" -u 8; exec 8>&-
+ [ -x "$CONTROLLER" ] && [ -x "$SELF" ] || { error 'The egress worker is unavailable'; return 1; }
+ OP_ID=$(cat "$UUID_FILE" 2>/dev/null); uuid_ok "$OP_ID" || { error 'An operation identity could not be created'; return 1; }
+ # SELF is a root-controlled deployment path, never a request parameter.
+ printf '%s\n' "$SELF" | grep -Eq '^/[a-zA-Z0-9_./-]+$' || { error 'The worker path is unsafe'; return 1; }
+ OP_ACTION=$action; OP_BOOT=$BOOT; OP_STARTED=$(epoch); OP_START_UTC=$(utc); OP_COMPLETED=; OP_RESULT=pending; OP_RUNNING=true; OP_EXIT=
+ save_operation || { error 'Operation state could not be reserved'; return 1; }
+ request=$(printf '{"name":"vpn-egress-web","instances":{"operation":{"command":["%s","worker","%s","%s"],"stdout":false,"stderr":false,"term_timeout":5}}}' "$SELF" "$OP_ACTION" "$OP_ID")
+ answer=$("$TIMEOUT" -k 1 5 "$UBUS" -S call service add "$request" 2>/dev/null); rc=$?
+ # procd versions return an empty object or an empty reply on successful add.
+ # Verify the registered command identity as well as the RPC acknowledgement.
+ compact=$(printf '%s' "$answer" | tr -d ' \t\r\n')
+ launch_ok=false
+ if [ "$rc" = 0 ] && { [ -z "$compact" ] || [ "$compact" = '{}' ]; }; then
+  if query_service && [ "$SERVICE_ID" = "$OP_ID" ] && [ "$SERVICE_ACTION" = "$OP_ACTION" ] && [ "$SERVICE_WORKER" = worker ] && [ "$SERVICE_EXEC" = "$SELF" ]; then launch_ok=true; fi
+ fi
+ if [ "$launch_ok" != true ]; then
+  OP_RUNNING=false; OP_RESULT=failed; OP_COMPLETED=$(utc); OP_EXIT=
+  save_operation || :
+  error 'The egress worker could not be started'; return 1
+ fi
+ printf '{"accepted":true,"operation":'; operation_json; printf '}\n'
+}
+
+finish_worker() {
+ result=$1; code=$2
+ worker_lock || return 1
+ load_operation || return 1
+ [ "$OP_ID" = "$WORK_ID" ] && [ "$OP_ACTION" = "$WORK_ACTION" ] && [ "$OP_BOOT" = "$BOOT" ] && [ "$OP_RUNNING" = true ] || return 1
+ OP_RUNNING=false; OP_RESULT=$result; OP_COMPLETED=$(utc); OP_EXIT=$code
+ save_operation; saved=$?
+ unlock
+ return "$saved"
+}
+
+interrupted() {
+ trap - HUP INT TERM
+ [ -z "$CHILD" ] || kill -TERM "$CHILD" 2>/dev/null || :
+ finish_worker interrupted '' >/dev/null 2>&1 || :
+ exit 130
+}
+
+worker() {
+ WORK_ACTION=$1; WORK_ID=$2
+ # A duplicate root-side invocation must not execute the same action twice.
+ exec 8<>"$RUN/execution.lock" || return 1
+ "$FLOCK" -n 8 || return 1
+ worker_lock || return 1
+ load_operation || return 1
+ [ "$OP_ID" = "$WORK_ID" ] && [ "$OP_ACTION" = "$WORK_ACTION" ] && [ "$OP_BOOT" = "$BOOT" ] && [ "$OP_RUNNING" = true ] || return 1
+ unlock
+ trap interrupted HUP INT TERM
+ # No raw controller output is stored or returned through the web API.
+ "$TIMEOUT" -k 5 75 "$CONTROLLER" "$WORK_ACTION" </dev/null >/dev/null 2>&1 &
+ CHILD=$!
+ wait "$CHILD"; rc=$?; CHILD=
+ trap - HUP INT TERM
+ case "$rc" in 0) result=success;; 124|137) result=timed_out;; *) result=failed;; esac
+ finish_worker "$result" "$rc"
+}
+
+case "${1:-}" in
+ status) [ "$#" = 1 ] || { error 'Invalid request'; exit 1; };;
+ submit) [ "$#" = 2 ] && action_ok "$2" || { error 'Invalid action'; exit 1; };;
+ worker) [ "$#" = 3 ] && action_ok "$2" && uuid_ok "$3" || { error 'Invalid worker request'; exit 1; };;
+ *) error 'Invalid request'; exit 1;;
+esac
+preflight || exit 1
+private_paths "$1" || exit 1
+trap unlock EXIT
+case "$1" in status) status;; submit) submit "$2";; worker) worker "$2" "$3";; esac

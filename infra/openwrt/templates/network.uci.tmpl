@@ -1,0 +1,20 @@
+# Desired-state sections for a fresh router. Not a replacement for unknown UCI.
+config interface 'wan'
+        option device 'eth0'
+        option proto 'dhcp'
+        option peerdns '1'
+
+config device
+        option name 'br-lan'
+        option type 'bridge'
+        list ports 'eth1'
+
+config interface 'lan'
+        option device 'br-lan'
+        option proto 'static'
+        option ipaddr '{{LAN_GATEWAY}}'
+        option netmask '255.255.255.0'
+        option delegate '0'
+
+config interface 'wan6'
+        option disabled '1'

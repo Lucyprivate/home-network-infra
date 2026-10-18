@@ -1,0 +1,248 @@
+#!/bin/sh
+# Root-only migration; no network, proxy, firewall or VM changes.
+set -eu
+umask 077
+
+usage() {
+	echo 'Usage: nlbw-persist migrate|rollback|status --backup /root/bandwidth-monitor-TOKEN/nlbwmon' >&2
+	exit 2
+}
+[ "$#" -eq 3 ] || usage
+ACTION=$1
+[ "$2" = --backup ] || usage
+BACKUP=$3
+case "$ACTION" in migrate|rollback|status) ;; *) usage ;; esac
+
+# The alternate root exists solely for offline tests. Never inherited in service use.
+ROOT=''
+if [ "${BWM_TEST_MODE:-0}" = 1 ]; then
+	ROOT=${BWM_TEST_ROOT:?test root required}
+	case "$ROOT" in /tmp/*) ;; *) echo 'Invalid test root' >&2; exit 2 ;; esac
+else
+	[ "$(id -u)" -eq 0 ] || { echo 'Root is required' >&2; exit 1; }
+fi
+case "$BACKUP" in /root/bandwidth-monitor-*/nlbwmon) ;; *) usage ;; esac
+case "$BACKUP" in *..*|*[!a-zA-Z0-9_./-]*) usage ;; esac
+BACKUP="$ROOT$BACKUP"
+OLD="$ROOT/var/lib/nlbwmon"
+NEW="$ROOT/etc/nlbwmon"
+CONFIG="$ROOT/etc/config/nlbwmon"
+KEEP="$ROOT/etc/sysupgrade.conf"
+INIT="$ROOT/etc/init.d/nlbwmon"
+LOCK="$ROOT/tmp/nlbw-persist.lock"
+VERIFIER=${BWM_VERIFIER:-/usr/libexec/nlbw-verify-migration.uc}
+if [ "${BWM_TEST_MODE:-0}" != 1 ]; then
+	[ "$VERIFIER" = /usr/libexec/nlbw-verify-migration.uc ] || exit 2
+fi
+exec 9>"$LOCK"
+flock -n 9 || { echo 'Another migration is active' >&2; exit 1; }
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+status() { [ -f "$BACKUP/status" ] && cat "$BACKUP/status" || echo NOT_STARTED; }
+state() { printf '%s\n' "$1" > "$BACKUP/status.new"; mv "$BACKUP/status.new" "$BACKUP/status"; }
+db_name() {
+	printf '%s\n' "$1" | grep -Eq '^[0-9]{8}\.db(\.gz)?$'
+}
+require_dir() {
+	[ -d "$1" ] && [ ! -L "$1" ] || die "Missing or symbolic directory: $1"
+}
+copy_dbs() {
+	# Byte-for-byte copy only; neither decompression nor date merging is permitted.
+	local src="$1" dst="$2" f name count=0
+	mkdir -p "$dst"
+	chmod 700 "$dst"
+	for f in "$src"/*.db "$src"/*.db.gz; do
+		[ -e "$f" ] || continue
+		[ -f "$f" ] && [ ! -L "$f" ] || die 'Nonregular database refused'
+		name=${f##*/}
+		db_name "$name" || die 'Unexpected database filename'
+		cp -p "$f" "$dst/$name.new"
+		cmp -s "$f" "$dst/$name.new" || die 'Database copy differs'
+		chmod 600 "$dst/$name.new"
+		mv "$dst/$name.new" "$dst/$name"
+		count=$((count + 1))
+	done
+	[ "$count" -gt 0 ] || die 'No database files were found'
+}
+hash_dbs() {
+	local dir="$1" out="$2" f
+	: > "$out"
+	for f in "$dir"/*.db "$dir"/*.db.gz; do
+		[ -f "$f" ] || continue
+		sha256sum "$f" >> "$out"
+	done
+}
+capture() {
+	local dir="$1" period
+	mkdir -p "$dir"; chmod 700 "$dir"
+	nlbw -c list > "$dir/periods"
+	[ -s "$dir/periods" ] || die 'No readable statistics periods'
+	while IFS= read -r period; do
+		printf '%s\n' "$period" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || die 'Invalid statistics period'
+		nlbw -c json -g ip,mac -t "$period" > "$dir/$period.json"
+		[ -s "$dir/$period.json" ] || die 'Empty statistics response'
+	done < "$dir/periods"
+	nlbw -c json -g ip,mac > "$dir/live.json"
+	[ -s "$dir/live.json" ] || die 'Empty live statistics response'
+}
+wait_stopped() {
+	local i=0
+	while pidof nlbwmon >/dev/null 2>&1; do
+		[ "$i" -lt 15 ] || die 'Normal nlbwmon stop timed out; do not force stop'
+		sleep 1; i=$((i + 1))
+	done
+	[ ! -e "$ROOT/tmp/0.db" ] || die 'Temporary cache still exists after normal stop'
+}
+stop_saved() {
+	nlbw -c commit > "$BACKUP/commit.log" 2>&1 || die 'Explicit database commit failed'
+	grep -Fqx '0 ok' "$BACKUP/commit.log" || die 'Database commit did not acknowledge a successful save'
+	"$INIT" stop || die 'Normal service stop failed'
+	wait_stopped
+}
+start_verified() {
+	"$INIT" start || die 'Service start failed'
+	local i=0
+	until pidof nlbwmon >/dev/null 2>&1 && nlbw -c list >/dev/null 2>&1; do
+		[ "$i" -lt 10 ] || die 'Service failed to become ready'
+		sleep 1; i=$((i + 1))
+	done
+}
+restore_keep() {
+	# Do not replace an unrelated later edit to the backup keep list.
+	if [ -f "$BACKUP/keep.applied" ] && cmp -s "$KEEP" "$BACKUP/keep.applied"; then
+		cp -p "$BACKUP/keep.before" "$KEEP"
+	elif [ -f "$BACKUP/keep.applied" ]; then
+		echo 'NOTE: system backup keep list changed later; preserved for inspection' >&2
+	fi
+}
+rollback_impl() {
+	local source="$1"
+	if pidof nlbwmon >/dev/null 2>&1; then stop_saved; fi
+	wait_stopped
+	# A fresh copy of the newest state is the rollback source. Old backups never
+	# overwrite live statistics, including a month created after migration.
+	if [ "$source" = new ]; then
+		copy_dbs "$NEW" "$BACKUP/latest-before-rollback"
+		hash_dbs "$BACKUP/latest-before-rollback" "$BACKUP/latest.sha256"
+		copy_dbs "$BACKUP/latest-before-rollback" "$OLD"
+	fi
+	uci -q revert nlbwmon || true
+	cp -p "$BACKUP/config.before" "$CONFIG"
+	restore_keep
+	start_verified
+	capture "$BACKUP/after-rollback"
+	if [ "$source" = new ] && [ -d "$BACKUP/before-rollback" ]; then
+		ucode "$VERIFIER" "$BACKUP/before-rollback" "$BACKUP/after-rollback" > "$BACKUP/rollback-verification.json"
+	fi
+	sync
+	state ROLLED_BACK
+}
+
+[ "$ACTION" != status ] || { status; exit 0; }
+require_dir "$ROOT/etc/config"
+[ -f "$CONFIG" ] && [ ! -L "$CONFIG" ] || die 'Missing or symbolic UCI configuration'
+[ -f "$KEEP" ] && [ ! -L "$KEEP" ] || die 'Missing or symbolic system backup keep list'
+[ -x "$INIT" ] || die 'nlbwmon service script not found'
+
+if [ "$ACTION" = rollback ]; then
+	require_dir "$BACKUP"
+	[ -f "$BACKUP/config.before" ] || die 'Original configuration is missing'
+	case "$(status)" in
+		ROLLED_BACK) echo ROLLED_BACK; exit 0 ;;
+		MIGRATED) ;;
+		*) die 'Only a completed migration can be manually rolled back' ;;
+	esac
+	[ "$(uci -q get nlbwmon.@nlbwmon[0].database_directory)" = /etc/nlbwmon ] || die 'Active database path has changed; inspect before rollback'
+	[ -z "$(uci changes nlbwmon)" ] || die 'Pending UCI changes; inspect before rollback'
+	capture "$BACKUP/before-rollback"
+	rollback_impl new
+	echo ROLLED_BACK
+	exit 0
+fi
+
+[ ! -e "$BACKUP" ] || die 'Backup path already exists; use a new private transaction'
+[ "$(uci -q get nlbwmon.@nlbwmon[0].database_directory)" = /var/lib/nlbwmon ] || die 'Unexpected active database path'
+! uci -q get nlbwmon.@nlbwmon[1] >/dev/null 2>&1 || die 'Multiple nlbwmon sections are not supported'
+[ -z "$(uci changes nlbwmon)" ] || die 'Pending UCI changes; inspect before migration'
+[ "$(uci -q get system.@system[0].timezone)" = UTC0 ] || die 'UTC timezone is required'
+require_dir "$OLD"
+if [ -e "$NEW" ]; then require_dir "$NEW"; else mkdir -p "$NEW"; fi
+# Verify the deepest mount covering the persistent target, including /etc mounts.
+awk -v path=/etc/nlbwmon '
+  ($2 == "/" || path == $2 || index(path, $2 "/") == 1) && length($2) > n {
+    n = length($2); fs = $3; opts = $4
+  }
+  END { if (fs != "ext4" || opts !~ /(^|,)rw(,|$)/) exit 1 }
+' "$ROOT/proc/mounts" || die 'Persistent directory is not on writable ext4'
+pidof nlbwmon >/dev/null 2>&1 || die 'nlbwmon must be running before migration'
+mkdir -p "$BACKUP"; chmod 700 "$BACKUP" "${BACKUP%/*}"
+cp -p "$CONFIG" "$BACKUP/config.before"
+cp -p "$KEEP" "$BACKUP/keep.before"
+chmod 600 "$BACKUP/config.before" "$BACKUP/keep.before"
+state PREPARING
+SOURCE=old
+RECOVER=0
+on_error() {
+	local rc=$?
+	trap - EXIT HUP INT TERM
+	[ "$rc" -ne 0 ] || return
+	if [ "$RECOVER" = 1 ]; then
+		echo 'Migration failed; attempting normal service recovery' >&2
+		if ( rollback_impl "$SOURCE" ); then
+			echo 'Recovered original service with latest available statistics' >&2
+		else
+			state RECOVERY_REQUIRED
+			echo "RECOVERY_REQUIRED: inspect private backup $BACKUP; no force stop attempted" >&2
+		fi
+	else
+		state ABORTED_BEFORE_STOP
+	fi
+	exit "$rc"
+}
+trap on_error EXIT
+trap 'exit 130' HUP INT TERM
+nlbw -c commit > "$BACKUP/commit-before.log" 2>&1 || die 'Explicit database commit failed'
+grep -Fqx '0 ok' "$BACKUP/commit-before.log" || die 'Database commit did not acknowledge a successful save'
+capture "$BACKUP/before"
+RECOVER=1
+"$INIT" stop || die 'Normal service stop failed'
+wait_stopped
+state STOPPED
+copy_dbs "$OLD" "$BACKUP/database.before"
+hash_dbs "$OLD" "$BACKUP/source.sha256"
+hash_dbs "$BACKUP/database.before" "$BACKUP/backup.sha256"
+# Refuse unrelated target histories or mixed compression versions of a date.
+for f in "$NEW"/*.db "$NEW"/*.db.gz; do
+	[ -e "$f" ] || continue
+	name=${f##*/}
+	[ -f "$f" ] && [ ! -L "$f" ] && db_name "$name" || die 'Unexpected target database'
+	[ -f "$OLD/$name" ] && cmp -s "$f" "$OLD/$name" || die 'Existing target database differs; preserve and inspect instead of merging'
+done
+copy_dbs "$BACKUP/database.before" "$NEW"
+hash_dbs "$NEW" "$BACKUP/target.sha256"
+chmod 700 "$NEW"
+uci set nlbwmon.@nlbwmon[0].database_directory=/etc/nlbwmon
+uci set nlbwmon.@nlbwmon[0].commit_interval=1h
+uci set nlbwmon.@nlbwmon[0].refresh_interval=30s
+uci set nlbwmon.@nlbwmon[0].database_generations=12
+uci set nlbwmon.@nlbwmon[0].database_interval=1
+uci set nlbwmon.@nlbwmon[0].database_limit=10000
+uci set nlbwmon.@nlbwmon[0].database_compress=1
+uci set nlbwmon.@nlbwmon[0].database_prealloc=0
+uci set nlbwmon.@nlbwmon[0].netlink_buffer_size=524288
+uci -q delete nlbwmon.@nlbwmon[0].local_network || true
+uci add_list nlbwmon.@nlbwmon[0].local_network=lan
+uci commit nlbwmon
+SOURCE=new
+for entry in /etc/nlbwmon/ /etc/proxy-usage/; do
+	grep -Fqx "$entry" "$KEEP" || printf '\n%s\n' "$entry" >> "$KEEP"
+done
+cp -p "$KEEP" "$BACKUP/keep.applied"
+start_verified
+capture "$BACKUP/after"
+ucode "$VERIFIER" "$BACKUP/before" "$BACKUP/after" > "$BACKUP/verification.json"
+sync
+state MIGRATED
+RECOVER=0
+trap - EXIT HUP INT TERM
+echo MIGRATED

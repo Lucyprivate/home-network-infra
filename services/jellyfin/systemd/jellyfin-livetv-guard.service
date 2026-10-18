@@ -1,0 +1,26 @@
+[Unit]
+Description=Jellyfin Live TV direct-route and LAN firewall guard
+Wants=network-online.target
+After=network-online.target docker.service
+Before=jellyfin-media-stack.service jellyfin-livetv.service
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/usr/bin/python3 /srv/jellyfin/tools/livetv/network_guard.py --once
+ExecStart=/usr/bin/python3 /srv/jellyfin/tools/livetv/network_guard.py
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_FOWNER
+
+[Install]
+WantedBy=multi-user.target

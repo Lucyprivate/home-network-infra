@@ -1,0 +1,10 @@
+{
+  "luci-app-proxy-usage": {
+    "description": "Read node bandwidth statistics",
+    "read": {
+      "ubus": {
+        "luci.proxy-usage": ["status", "periods", "export"]
+      }
+    }
+  }
+}
